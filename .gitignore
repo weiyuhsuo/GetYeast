@@ -1,0 +1,57 @@
+# ===== 训练/推理产物（体积大，勿入库） =====
+output/
+outputs/
+multirun/
+.hydra/
+
+# ===== 原始与中间数据 =====
+input/
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.parquet
+*.feather
+
+# ===== 模型权重与 checkpoint =====
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+
+# ===== 大体积表格与日志 =====
+*.csv
+*.tsv
+*.log
+*.out
+
+# ===== Python / Jupyter =====
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ===== 编辑器与系统 =====
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# ===== 密钥与本地配置（切勿提交） =====
+.env
+.env.*
+*.pem
+id_rsa
+id_rsa.pub
+secrets/

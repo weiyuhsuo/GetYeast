@@ -1,0 +1,163 @@
+# ===== Hydra框架基本配置 =====
+# Hydra是Facebook开发的配置管理框架，用于管理复杂的实验配置
+defaults:
+  - _self_                    # 继承当前配置文件本身
+  - override hydra/hydra_logging: disabled    # 禁用Hydra框架自身的日志输出
+  - override hydra/job_logging: disabled      # 禁用Hydra作业日志，避免日志冲突
+
+# ===== 训练阶段配置 =====
+stage: "fit"                  # 训练阶段标识："fit"表示训练模式，"test"表示测试模式
+eval_tss: false               # 是否评估TSS（转录起始位点），当前关闭
+
+# ===== 微调配置模板（注释掉的示例） =====
+# Inherit from a finetune config template if available and appropriate
+# - finetune: v1_finetune@finetune # 示例：继承微调配置模板
+
+# ===== 实验基础配置 =====
+experiment:
+  name: yeast_atac_training   # 实验名称，用于标识和区分不同实验
+  seed: 42                    # 随机种子：控制所有随机过程（权重初始化、数据打乱、dropout等）
+                              # 42是经典选择，确保实验可重复性
+  debug: false                # 调试模式开关：true时启用详细调试信息，false为正常模式
+
+# ===== 训练超参数配置（针对A100 GPU优化） =====
+training:
+  batch_size: 4096            # 批次大小：每次训练使用的样本数量，4096适合A100 GPU显存
+  num_workers: 16             # 数据加载器工作进程数：并行加载数据，16是CPU核心数的合理比例
+  learning_rate: 0.004        # 学习率：参数更新步长，0.004配合大批次训练使用
+  weight_decay: 0.01          # 权重衰减：L2正则化系数，防止过拟合
+  max_epochs: 100             # 最大训练轮数：完整遍历数据集的次数上限（配合带重启的余弦调度）
+  warmup_epochs: 3            # 预热轮数：学习率从0线性增长到目标值的轮数，提升训练稳定性
+  early_stopping_patience: 15 # 早停耐心值：验证损失连续10轮不改善时停止训练
+  early_stopping_min_delta: 0.01  # 早停最小改善阈值：只有改善超过此值才重置耐心计数器
+  clip_grad: 1.0              # 梯度裁剪阈值：防止梯度爆炸，将梯度范数限制在1.0以内
+  use_fp16: true              # 混合精度训练：使用16位浮点数加速训练，节省显存
+
+# ===== 数据路径配置（集中管理，便于修改） =====
+# SC酵母数据：单个样本（ATAC1）
+data:
+  input_files:
+    atac1: 'input/train_251208/ATAC1.npz'  # ATAC1样本（Saccharomyces cerevisiae）
+  output_base_dir: 'output'    # 所有输出文件的基础目录
+  # 新增：数据划分策略，可选:
+  #   'peak'   : 按基因组位点划分 (同一peak所有样本/条件进入同一集合)。
+  #              优势: 测试模型在未见过位点上的泛化；风险: 基因级评估需对缺列做归一化修正。
+  #   'sample' : 按样本划分 (一个样本的全部peaks保持在同一集合)。
+  #              优势: 基因级评估无峰缺失，数值更稳定；风险: 对新位点泛化不足。
+  # 本项目当前论文主结果建议：peak 划分 + 明确区分 PEAK vs GENE level 指标。
+  split_strategy: 'sample'
+  # 多数据集是否允许尝试 gene-level 评估（若某子数据集缺失映射则自动跳过该子集）。
+  multi_dataset_gene_eval: true
+  # ====== 基因级真实TPM支持 ======
+  # real_gene_tpm_csv: 指向包含真实基因TPM的CSV文件；需含首列基因ID，后续列为各条件/重复的TPM值。
+  # use_real_gene_truth: 若为true，将在gene级评估时使用此CSV汇总(按gene_truth_reduce聚合)作为真实值。
+  # gene_truth_reduce: 真实TPM多列聚合方式：mean | median | max | min。
+  # tpm_aggregation: 对模型 peak 预测的 gene 聚合策略：
+  #   'logspace_direct' -> 现有方式：直接在 log2(TPM+1) 空间用 g2p 权重聚合。
+  #   'tpm_then_log'   -> 先反变换到TPM: TPM = 2**log2_expr - 1, 聚合后再 log2(TPM+1)。更贴近真实计数。
+  # SC酵母真实TPM文件（如果存在）
+  # real_gene_tpm_csv: 'input/251113/SC_expression.csv'
+  use_real_gene_truth: false  # SC暂时不使用真实TPM对比
+  gene_truth_reduce: 'mean'
+  tpm_aggregation: 'tpm_then_log'  # 使用TPM域聚合（生物学正确方式）
+  
+  # 滑动窗口配置（用于train_yeast_windowed.py）
+  window_size: 200             # 窗口大小：每次输入200个连续peaks
+  step_size: 100               # 滑动步长：每隔100个peaks采样一次
+  max_span_bp: 5000000         # 窗口最大跨度：5Mb（避免跨越染色体臂）
+
+# ===== 训练任务描述配置 =====
+training_name: 'SC ATAC Single Peak Training'        # 训练任务名称，用于日志和报告
+training_description: '使用SC酵母ATAC数据训练，采用单Peak方法'  # 训练任务详细描述
+output_dir: 'sc_atac_single_peak_training'           # 本次训练的输出子目录
+
+# ===== 日志和监控配置 =====
+logging:
+  save_dir: 'output/sc_yeast_atac_training'          # 日志文件保存目录
+  tensorboard: true                               # 启用TensorBoard可视化：记录训练曲线和指标
+  wandb: true                                     # 启用Weights & Biases：云端实验跟踪平台
+  project_name: 'sc_yeast_atac_training'             # W&B项目名称
+  run_name: 'sc_atac_single_peak_v1'                # 当前运行名称，用于区分不同实验
+  use_wandb: false                                # 实际是否使用W&B：false表示暂时关闭
+
+# ===== 学习率调度器配置 =====
+scheduler:
+  type: 'cosine'              # 调度器类型：余弦退火调度
+  cosine:
+    eta_min: 1e-5             # 最小学习率：从1e-6提高到3e-5，避免后期衰减过快
+    
+# 学习率调度策略说明：
+# 策略：余弦退火 + Warmup (CosineAnnealingLR)
+# 
+# 训练流程（100 epochs, warmup=2）：
+# 1. Warmup (0-2轮):    学习率从0线性增长到0.006（提供训练初期稳定性）
+# 2. Cosine Decay (2-100轮): 余弦衰减，峰值0.006 → 最低3e-5
+# 
+# 优势：
+# - 简单稳定，适合大部分场景
+# - 学习率平滑下降，不会突然跳跃
+# - eta_min=3e-5 足够大，避免后期学习率过小
+# 
+# 学习率曲线：
+# - Epoch 0-2:   0 → 0.006 (warmup)
+# - Epoch 2-100: 0.006 → 3e-5 (cosine decay)
+
+# ===== 模型架构配置 =====
+# SC酵母特征维度：470 motifs (已区分strand) + 1 accessibility + 74 conditions = 545
+model:
+  model:
+    # 区域嵌入层配置
+    region_embed:
+      num_features: 545       # 输入特征维度：470个motif + 1个accessibility + 74个条件特征
+      embed_dim: 768          # 嵌入维度：将输入特征映射到768维向量空间
+    
+    # Transformer编码器配置
+    encoder:
+      embed_dim: 768         # 编码器嵌入维度：与输入嵌入保持一致
+      num_heads: 12          # 多头注意力头数：12个头，每个头64维（768/12=64）
+      num_layers: 12         # Transformer层数：12层编码器，类似BERT-base架构
+      dropout: 0.1           # Dropout率：训练时随机丢弃10%的神经元，防止过拟合
+    
+    # 表达预测头配置
+    head_exp:
+      embed_dim: 768         # 输入维度：接收编码器输出的768维特征
+      output_dim: 2          # 输出维度：预测正链和负链的表达水平
+    
+    # 掩码令牌配置
+    mask_token:
+      embed_dim: 768         # 掩码令牌维度：与模型其他部分保持一致
+      std: 0.02              # 掩码令牌初始化标准差：小方差初始化
+    
+    # 损失函数配置
+    loss:
+      components:
+        exp:                 # 表达预测损失组件
+          _target_: torch.nn.MSELoss  # 使用均方误差损失函数
+          reduction: "mean"           # 损失计算方式：对所有样本求平均
+      weights:
+        exp: 1.0             # 损失权重：表达预测损失的权重系数
+    
+    # 评估指标配置
+    metrics:
+      components:
+        exp: ["pearson", "spearman", "r2"]  # 表达预测的评估指标：皮尔逊相关系数、斯皮尔曼相关系数、R²决定系数
+
+# ===== 推理配置（集中管理，便于修改） =====
+inference:
+  # 输入数据路径（相对路径，相对于脚本所在目录）
+  # weiyushuo/mac-yeast-data-process/GetForYeast/input/ATAC1_replacements.npz
+  data_path: 'input/260203/recombined.npz'
+  
+  # 模型checkpoint路径（相对路径，相对于脚本所在目录）
+  # 第二三次预测
+  model_path: 'output/sc_atac_single_peak_training_20251209_142840/best_model.pth'
+  # 第四次预测，没有权重归一化
+  # weiyushuo/mac-yeast-data-process/GetForYeast/output/sc_atac_single_peak_training_20251128_194657/best_model.pth
+  # model_path: 'output/sc_atac_single_peak_training_20251128_194657/best_model.pth'
+  
+  # 推理batch大小（建议使用较小值，避免显存不足）
+  batch_size: 512
+  # 计算设备：auto/cpu/cuda（auto表示自动选择）
+  device: 'auto'
+  # 输出基础目录（相对路径）
+  output_base_dir: 'output'
