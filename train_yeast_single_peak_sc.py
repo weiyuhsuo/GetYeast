@@ -1354,27 +1354,15 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
             avg_train_mae = 0
         
         # ========== 验证阶段 (Validation Phase) ==========
-        # 同时计算peak级和gene级指标
-        # 这允许我们在两个层级评估模型性能：
-        # 1. Peak级：直接评估peak预测的准确性
-        # 2. Gene级：将peak预测聚合为gene表达后评估（更符合生物学意义）
+        # 只使用 peak 级指标作为每个 epoch 的主要评估口径
+        # 这样可以和你希望的 peak-level 训练方式保持一致
         val_eval = evaluate_model_gene_level(model, val_loader, device, logger, "validation")
         val_loss = val_eval['avg_loss']
-        
-        # ========== 选择主要监控指标 ==========
-        # 优先使用gene级指标（如果有g2p映射）
-        # 原因：基因表达是最终预测目标，更能反映模型的真实性能
-        # 如果没有gene级数据（缺少g2p映射），则使用peak级指标
-        if val_eval['gene']['metrics']:
-            val_pearson = val_eval['gene']['metrics'].get('pearson_r', float('nan'))
-            val_mae = val_eval['gene']['metrics'].get('mae', float('nan'))
-            val_r2 = val_eval['gene']['metrics'].get('r2', float('nan'))
-            val_spearman = val_eval['gene']['metrics'].get('spearman_rho', float('nan'))
-        else:
-            val_pearson = val_eval['peak']['metrics'].get('pearson_r', float('nan'))
-            val_mae = val_eval['peak']['metrics'].get('mae', float('nan'))
-            val_r2 = val_eval['peak']['metrics'].get('r2', float('nan'))
-            val_spearman = val_eval['peak']['metrics'].get('spearman_rho', float('nan'))
+
+        val_pearson = val_eval['peak']['metrics'].get('pearson_r', float('nan'))
+        val_mae = val_eval['peak']['metrics'].get('mae', float('nan'))
+        val_r2 = val_eval['peak']['metrics'].get('r2', float('nan'))
+        val_spearman = val_eval['peak']['metrics'].get('spearman_rho', float('nan'))
 
         # 用 peak 级数据计算回归斜率和截距（用于可视化）
         try:
@@ -1385,7 +1373,7 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
         except Exception:
             val_slope, val_intercept = float('nan'), float('nan')
         
-        # 记录到TensorBoard - 混合指标 + Gene指标
+        # 记录到TensorBoard（主监控改为 peak 指标）
         writer.add_scalar('Loss/Train', avg_train_loss, epoch)
         writer.add_scalar('Loss/Validation', val_loss, epoch)
         writer.add_scalar('MAE/Train', avg_train_mae, epoch)
@@ -1393,11 +1381,11 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
         current_lr = optimizer.param_groups[0]['lr']
         writer.add_scalar('Learning_Rate', current_lr, epoch)
         lr_history.append(current_lr)
-        writer.add_scalar('Pearson/Validation', val_pearson, epoch)  # Pearson相关系数 (主监控)
+        writer.add_scalar('Pearson/Validation', val_pearson, epoch)
         writer.add_scalar('Spearman/Validation', val_spearman, epoch)
         writer.add_scalar('R2/Validation', val_r2, epoch)
 
-        # 同时记录peak级指标，便于对比
+        # 仍保留 peak/gene 记录，便于对比
         if val_eval['peak']['metrics']:
             writer.add_scalar('Peak/Pearson', val_eval['peak']['metrics'].get('pearson_r', float('nan')), epoch)
             writer.add_scalar('Peak/MAE', val_eval['peak']['metrics'].get('mae', float('nan')), epoch)
