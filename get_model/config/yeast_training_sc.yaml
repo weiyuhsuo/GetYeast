@@ -37,8 +37,9 @@ training:
 # SC酵母数据：单个样本（ATAC1）
 data:
   input_files:
-    atac1: 'input/train_251208/ATAC1.npz'  # ATAC1样本（Saccharomyces cerevisiae）
+    atac1: 'data/SC_ATAC1.npz'  # ATAC1样本（Saccharomyces cerevisiae）
   output_base_dir: 'output'    # 所有输出文件的基础目录
+  split_cache_path: 'data/SC_ATAC1_split_meta.json'
   # 新增：数据划分策略，可选:
   #   'peak'   : 按基因组位点划分 (同一peak所有样本/条件进入同一集合)。
   #              优势: 测试模型在未见过位点上的泛化；风险: 基因级评估需对缺列做归一化修正。
@@ -46,6 +47,7 @@ data:
   #              优势: 基因级评估无峰缺失，数值更稳定；风险: 对新位点泛化不足。
   # 当前 SC 训练使用 sample split；如需改为 peak split，只需改这里。
   split_strategy: 'sample'
+  split_seed: 42
   # 多数据集是否允许尝试 gene-level 评估（若某子数据集缺失映射则自动跳过该子集）。
   multi_dataset_gene_eval: true
   # ====== 基因级真实TPM支持 ======
