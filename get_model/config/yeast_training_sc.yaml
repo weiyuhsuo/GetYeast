@@ -45,7 +45,7 @@ data:
   #              优势: 测试模型在未见过位点上的泛化；风险: 基因级评估需对缺列做归一化修正。
   #   'sample' : 按样本划分 (一个样本的全部peaks保持在同一集合)。
   #              优势: 基因级评估无峰缺失，数值更稳定；风险: 对新位点泛化不足。
-  # 当前 SC 训练使用 sample split；如需改为 peak split，只需改这里。
+  # 本项目当前论文主结果建议：peak 划分 + 明确区分 PEAK vs GENE level 指标。
   split_strategy: 'sample'
   split_seed: 42
   # 多数据集是否允许尝试 gene-level 评估（若某子数据集缺失映射则自动跳过该子集）。
