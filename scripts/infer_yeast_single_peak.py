@@ -62,7 +62,10 @@ import sys
 import logging
 
 # 添加模型路径到sys.path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, SCRIPT_DIR)
+sys.path.insert(0, PROJECT_ROOT)
 from get_model.model.yeast_model import YeastModel
 from omegaconf import DictConfig, OmegaConf
 
@@ -132,104 +135,132 @@ def load_model(checkpoint_path: str, device: torch.device):
 
 def load_data(npz_path: str):
     """
-    加载npz数据文件
-    
-    Args:
-        npz_path: npz文件路径
-    
-    Returns:
-        data: 数据数组 (samples, peaks, features)
-        peak_ids: peak ID列表
+    加载npz数据文件。支持两种布局：
+    1) dense: data = samples x peaks x features
+    2) factorized_npz_v1: peak_features + condition_features + peak_expression
+
+    factorized 输入会在内存中重构为小型 dense 数组供旧推理流程使用；
+    peak_expression 在这些虚拟推理文件里是占位块，不作为真实标签输出。
     """
     logger = logging.getLogger(__name__)
     logger.info(f"加载数据: {npz_path}")
-    
-    # 检查文件是否存在
+
     if not os.path.exists(npz_path):
         raise FileNotFoundError(f"数据文件不存在: {npz_path}")
-    
-    # 检查文件大小
+
     file_size = os.path.getsize(npz_path)
     if file_size == 0:
         raise ValueError(f"数据文件为空: {npz_path}")
     logger.info(f"文件大小: {file_size / (1024*1024):.2f} MB")
-    
-    # 尝试加载文件（先尝试不使用mmap，如果失败再尝试mmap）
-    npz_file = None
+
     try:
-        # 方法1: 不使用mmap（更稳定，适合网络文件系统）
         npz_file = np.load(npz_path, allow_pickle=True)
         logger.info("使用标准模式加载文件（非mmap）")
     except EOFError:
-        # 如果标准模式失败，尝试mmap模式
         try:
             logger.warning("标准模式加载失败，尝试mmap模式...")
             npz_file = np.load(npz_path, mmap_mode='r', allow_pickle=True)
             logger.info("使用mmap模式加载文件")
-        except EOFError as e:
-            raise ValueError(f"数据文件损坏或格式错误: {npz_path}\n"
-                            f"错误详情: {e}\n"
-                            f"可能原因: 文件传输不完整、网络文件系统问题、或文件损坏\n"
-                            f"建议: 1) 检查文件MD5值 2) 重新复制文件 3) 重新生成npz文件")
         except Exception as e:
-            raise ValueError(f"无法加载数据文件: {npz_path}\n"
-                            f"错误详情: {e}")
+            raise ValueError(f"数据文件损坏或格式错误: {npz_path}\n错误详情: {e}")
     except Exception as e:
-        raise ValueError(f"无法加载数据文件: {npz_path}\n"
-                        f"错误详情: {e}")
-    
-    # 读取数据
-    data = npz_file['data']
-    
-    # 检查数据是否为空
-    if data is None:
-        raise ValueError(f"数据文件中的'data'键为空: {npz_path}")
-    
-    # 获取数据形状
-    if isinstance(data, np.ndarray):
+        raise ValueError(f"无法加载数据文件: {npz_path}\n错误详情: {e}")
+
+    files = set(npz_file.files)
+    is_factorized = {'peak_features', 'condition_features', 'peak_expression'}.issubset(files)
+
+    if 'data' in files:
+        data = np.asarray(npz_file['data'], dtype=np.float32)
+        layout = 'dense'
+        if data.ndim != 3:
+            raise ValueError(f"dense data维度应为3，实际: {data.shape}")
         num_samples, num_peaks, num_features = data.shape
+        if num_features == 547:
+            feature_dim = 545
+            label_pos_idx = 545
+            label_neg_idx = 546
+            logger.info("✅ 数据格式正确: dense 547列 = 545特征 + 2标签")
+        elif num_features == 545:
+            feature_dim = 545
+            label_pos_idx = None
+            label_neg_idx = None
+            logger.info("✅ 数据格式: dense 545列（仅特征，无标签）")
+        else:
+            raise ValueError(f"数据维度不匹配: 期望547或545，实际={num_features}")
+    elif is_factorized:
+        layout = 'factorized_npz_v1'
+        peak_features = np.asarray(npz_file['peak_features'], dtype=np.float32)
+        condition_features = np.asarray(npz_file['condition_features'], dtype=np.float32)
+        peak_expression = np.asarray(npz_file['peak_expression'], dtype=np.float32)
+
+        if peak_features.ndim != 2:
+            raise ValueError(f"peak_features应为2维，实际: {peak_features.shape}")
+        if condition_features.ndim != 2:
+            raise ValueError(f"condition_features应为2维，实际: {condition_features.shape}")
+        if peak_expression.ndim != 3:
+            raise ValueError(f"peak_expression应为3维，实际: {peak_expression.shape}")
+
+        num_peaks, n_peak_features = peak_features.shape
+        num_samples, n_condition_features = condition_features.shape
+        if peak_expression.shape[0] != num_samples or peak_expression.shape[1] != num_peaks:
+            raise ValueError(
+                "factorized数组维度不一致: "
+                f"peak_features={peak_features.shape}, condition_features={condition_features.shape}, "
+                f"peak_expression={peak_expression.shape}"
+            )
+
+        feature_dim = n_peak_features + n_condition_features
+        all_features = np.zeros((num_samples, num_peaks, feature_dim), dtype=np.float32)
+        all_features[:, :, :n_peak_features] = peak_features[None, :, :]
+        all_features[:, :, n_peak_features:] = condition_features[:, None, :]
+        data = np.concatenate([all_features, peak_expression.astype(np.float32)], axis=-1)
+        num_features = data.shape[-1]
+
+        label_pos_idx = None
+        label_neg_idx = None
+        logger.info(
+            "✅ 数据格式: factorized_npz_v1 -> 重构 dense "
+            f"{data.shape}; 模型特征维度={feature_dim}"
+        )
     else:
-        # 如果是mmap，需要先获取形状
-        num_samples, num_peaks, num_features = data.shape
-    
+        raise KeyError(
+            "npz中既没有dense 'data'，也没有factorized所需的 "
+            "peak_features/condition_features/peak_expression"
+        )
+
+    logger.info(f"数据布局: {layout}")
     logger.info(f"数据形状: ({num_samples}, {num_peaks}, {num_features})")
-    
-    # 检查数据维度是否有效
+
     if num_samples == 0:
         raise ValueError(f"数据样本数为0: {npz_path}")
     if num_peaks == 0:
         raise ValueError(f"数据peaks数为0: {npz_path}")
     if num_features == 0:
         raise ValueError(f"数据特征数为0: {npz_path}")
-    
-    # 检查数据内容（采样检查，避免加载全部数据到内存）
+    if feature_dim != 545:
+        raise ValueError(f"模型期望545维输入特征，当前重构特征维度={feature_dim}")
+
     logger.info("检查数据内容...")
     try:
-        # 检查第一个样本的第一个peak的数据
-        sample_data = data[0, 0, :]
-        non_zero_count = np.count_nonzero(sample_data)
-        nan_count = np.isnan(sample_data).sum()
-        inf_count = np.isinf(sample_data).sum()
-        
-        logger.info(f"  第一个样本第一个peak: 非零值={non_zero_count}/{len(sample_data)}, NaN={nan_count}, Inf={inf_count}")
-        
-        # 随机采样几个位置检查
-        if num_samples > 0 and num_peaks > 0:
-            check_indices = [
-                (0, 0),
-                (min(num_samples//2, num_samples-1), min(num_peaks//2, num_peaks-1)),
-                (num_samples-1, num_peaks-1)
-            ]
-            for s_idx, p_idx in check_indices:
-                if s_idx < num_samples and p_idx < num_peaks:
-                    check_data = data[s_idx, p_idx, :]
-                    check_non_zero = np.count_nonzero(check_data)
-                    check_nan = np.isnan(check_data).sum()
-                    logger.info(f"  样本[{s_idx}]峰值[{p_idx}]: 非零值={check_non_zero}/{len(check_data)}, NaN={check_nan}")
+        sample_data = data[0, 0, :feature_dim]
+        logger.info(
+            f"  第一个样本第一个peak: 非零值={np.count_nonzero(sample_data)}/{len(sample_data)}, "
+            f"NaN={np.isnan(sample_data).sum()}, Inf={np.isinf(sample_data).sum()}"
+        )
+        check_indices = [
+            (0, 0),
+            (min(num_samples//2, num_samples-1), min(num_peaks//2, num_peaks-1)),
+            (num_samples-1, num_peaks-1),
+        ]
+        for s_idx, p_idx in check_indices:
+            check_data = data[s_idx, p_idx, :feature_dim]
+            logger.info(
+                f"  样本[{s_idx}]峰值[{p_idx}]: 非零值={np.count_nonzero(check_data)}/{len(check_data)}, "
+                f"NaN={np.isnan(check_data).sum()}"
+            )
     except Exception as e:
         logger.warning(f"⚠️ 数据内容检查时出错: {e}，继续处理...")
-    
-    # 读取peak_ids
+
     try:
         peak_ids = npz_file['peak_ids']
         if hasattr(peak_ids, 'tolist'):
@@ -247,23 +278,7 @@ def load_data(npz_path: str):
     except Exception:
         sample_ids = [str(i) for i in range(num_samples)]
         logger.warning("⚠️ 未找到sample_ids，使用顺序编号")
-    
-    # 验证数据格式
-    if num_features == 547:
-        # 标准格式：545特征 + 2标签
-        feature_dim = 545
-        label_pos_idx = 545
-        label_neg_idx = 546
-        logger.info(f"✅ 数据格式正确: 547列 = 545特征 + 2标签")
-    elif num_features == 545:
-        # 只有特征，没有标签（推理场景）
-        feature_dim = 545
-        label_pos_idx = None
-        label_neg_idx = None
-        logger.info(f"✅ 数据格式: 545列（仅特征，无标签）")
-    else:
-        raise ValueError(f"数据维度不匹配: 期望547或545，实际={num_features}")
-    
+
     return {
         'data': data,
         'peak_ids': peak_ids,
@@ -272,7 +287,8 @@ def load_data(npz_path: str):
         'label_pos_idx': label_pos_idx,
         'label_neg_idx': label_neg_idx,
         'num_samples': num_samples,
-        'num_peaks': num_peaks
+        'num_peaks': num_peaks,
+        'layout': layout,
     }
 
 def predict(model, data_info, device, batch_size=32):

@@ -20,21 +20,29 @@
 - 训练完成后使用测试脚本进行评估
 """
 
+import os
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, SCRIPT_DIR)
+sys.path.insert(0, PROJECT_ROOT)
+
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.utils.data import Dataset, DataLoader, random_split, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader, random_split
 from get_model.model.yeast_model import YeastModel
 import logging
-from pathlib import Path
-import os
+import json
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts, StepLR, ExponentialLR, SequentialLR, LinearLR
 import signal
-import sys
 import atexit
 import time
 import datetime
+import json
 import matplotlib.pyplot as plt
 import pandas as pd
 from scipy.stats import pearsonr, linregress, spearmanr
@@ -46,65 +54,29 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
+
+def resolve_existing_path(path_like, base_dir):
+    """Resolve a possibly relative or symlink path against several common roots."""
+    if path_like is None:
+        return None
+    p = Path(path_like)
+    if p.exists():
+        return p
+
+    base_dir = Path(base_dir)
+    candidates = [
+        base_dir / p,
+        base_dir.parent / p,
+        base_dir.parent.parent / p,
+        Path.cwd() / p,
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return None
+
 warnings.filterwarnings("ignore")
 
-# =============================================================
-# 工具函数：加载真实基因TPM CSV并聚合为 log2(TPM+1)
-# =============================================================
-def load_real_gene_tpm_csv(csv_path: str, reduce: str = 'mean', gene_col: str = 'Gene', logger: logging.Logger = None) -> dict:
-    """加载真实基因TPM CSV文件，按行聚合为 log2(TPM+1)。
-
-    参数:
-      - csv_path: 真实TPM CSV路径
-      - reduce: 对多列TPM的聚合方式: mean/median/max/min
-      - gene_col: 基因ID列名
-      - logger: 可选logger
-
-    返回:
-      - dict[str, float]: 基因ID -> log2(聚合TPM + 1)
-    """
-    lg = logger or logging.getLogger(__name__)
-    if not csv_path or not os.path.exists(csv_path):
-        lg.warning(f"真实TPM文件不存在: {csv_path}")
-        return {}
-    try:
-        df = pd.read_csv(csv_path)
-    except Exception as e:
-        lg.error(f"读取真实TPM CSV失败: {e}")
-        return {}
-    if gene_col not in df.columns:
-        lg.error(f"真实TPM CSV缺少'{gene_col}'列，跳过加载")
-        return {}
-    value_cols = [c for c in df.columns if c != gene_col]
-    for c in value_cols:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
-    df_valid = df.dropna(subset=value_cols, how='all').copy()
-    if df_valid.empty:
-        lg.warning("真实TPM CSV中没有有效的数值列，返回空映射")
-        return {}
-    reduce = (reduce or 'mean').lower()
-    out: dict[str, float] = {}
-    for _, row in df_valid.iterrows():
-        vals = row[value_cols].dropna().astype(float).values
-        if vals.size == 0:
-            continue
-        if reduce == 'median':
-            tpm_val = float(np.median(vals))
-        elif reduce == 'max':
-            tpm_val = float(np.max(vals))
-        elif reduce == 'min':
-            tpm_val = float(np.min(vals))
-        else:
-            tpm_val = float(np.mean(vals))
-        gene_id = str(row[gene_col])
-        
-        # 移除 Kmarxianus_ 前缀，统一命名格式
-        if gene_id.startswith('Kmarxianus_'):
-            gene_id = gene_id.replace('Kmarxianus_', '', 1)
-        
-        out[gene_id] = float(np.log2(tpm_val + 1.0))
-    lg.info(f"真实TPM加载完成: {len(out)} 个基因 (reduce={reduce}, 值=log2(TPM+1))")
-    return out
 # ============================================================================
 # 全局变量（用于优雅中断处理）
 # ============================================================================
@@ -119,11 +91,16 @@ current_logger = None  # 当前日志记录器
 current_output_dir = None  # 当前输出目录
 current_peak_ids = None  # 保存用于CSV导出的peak_id列表
 
-
 def signal_handler(signum, frame):
-    """处理中断信号（SIGINT/SIGTERM）。"""
+    """
+    处理中断信号（SIGINT/SIGTERM）
+    
+    Args:
+        signum: 信号编号
+        frame: 当前堆栈帧
+    """
     global interrupted, current_logger
-    interrupted = True
+    interrupted = True  # 设置中断标志
     if current_logger:
         current_logger.warning(f"收到中断信号 {signum}，准备保存模型并执行测试...")
     else:
@@ -132,6 +109,7 @@ def signal_handler(signum, frame):
 def cleanup_and_test():
     """清理并执行测试：在被中断时做一次快速测试并存盘。"""
     global current_model, current_test_loader, current_device, current_logger, current_output_dir, training_completed
+    
     # 如果训练已经正常完成，不执行中断测试
     if training_completed:
         if current_logger:
@@ -142,6 +120,7 @@ def cleanup_and_test():
         try:
             if current_logger:
                 current_logger.info("开始执行中断后的测试...")
+            
             # 确保模型在评估模式
             current_model.eval()
             
@@ -150,50 +129,27 @@ def cleanup_and_test():
             test_loss, test_mae, test_slope, test_intercept, test_preds, test_targets, test_p, \
                 test_peak_indices, test_sample_indices, test_strands = test_eval
             
-            # 重新计算需要的统计量（仅测试集整体的相关性和回归，不做TPM域聚合，这部分留在正式评估函数中）
+            # 重新计算需要的统计量
             from scipy.stats import spearmanr as _spearmanr
             test_spearman, _ = _spearmanr(test_targets, test_preds)
             test_r2 = r2_score(test_targets, test_preds)
             
             # 保存预测结果
             try:
-                # 优先带peak_id和sample_id
+                # 优先带peak_id
                 min_len = min(len(test_preds), len(test_peak_indices), len(test_sample_indices), len(test_strands))
                 preds_np = np.array(test_preds)[:min_len]
                 trues_np = np.array(test_targets)[:min_len]
                 peak_idx_np = np.array(test_peak_indices)[:min_len]
                 sample_idx_np = np.array(test_sample_indices)[:min_len]
                 strand_np = np.array(test_strands)[:min_len]
-                
-                # 映射peak_id
                 if current_peak_ids is not None:
                     peak_id_vals = [str(current_peak_ids[int(i)]) if int(i) < len(current_peak_ids) else '' for i in peak_idx_np]
                 else:
                     peak_id_vals = [''] * min_len
-                
-                # 尝试获取sample_ids（从数据加载器）
-                sample_id_vals = [str(i) for i in sample_idx_np]  # 默认使用sample_idx
-                try:
-                    if current_test_loader is not None:
-                        dataset = current_test_loader.dataset
-                        # 尝试获取底层数据集的sample_ids
-                        base_ds = dataset
-                        while hasattr(base_ds, 'dataset') or hasattr(base_ds, 'base'):
-                            if hasattr(base_ds, 'base'):
-                                base_ds = base_ds.base
-                            elif hasattr(base_ds, 'dataset'):
-                                base_ds = base_ds.dataset
-                            else:
-                                break
-                        if hasattr(base_ds, 'sample_ids') and base_ds.sample_ids is not None:
-                            sample_id_vals = [str(base_ds.sample_ids[int(i)]) if int(i) < len(base_ds.sample_ids) else str(i) for i in sample_idx_np]
-                except Exception:
-                    pass  # 如果获取失败，使用默认的sample_idx
-                
                 strand_str = np.where(strand_np == 0, 'pos', 'neg')
                 df_test = pd.DataFrame({
                     'sample_idx': sample_idx_np,
-                    'sample_id': sample_id_vals,
                     'peak_idx': peak_idx_np,
                     'peak_id': peak_id_vals,
                     'strand': strand_str,
@@ -274,20 +230,39 @@ atexit.register(cleanup_and_test)
 # ============================================================================
 # 数据集类：单Peak数据集
 # ============================================================================
+class _FactorizedDataView:
+    """兼容旧代码中少量 self.data.shape / self.data[s, p, col] 的访问。"""
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.shape = (owner.num_samples, owner.num_peaks, owner.num_features_all)
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            raise TypeError("factorized 数据不支持直接切片整个 dense cube")
+        if len(key) == 2:
+            sample_idx, peak_idx = key
+            return self.owner._build_dense_row(int(sample_idx), int(peak_idx))
+        if len(key) == 3:
+            sample_idx, peak_idx, feature_idx = key
+            return self.owner._build_dense_row(int(sample_idx), int(peak_idx))[feature_idx]
+        raise IndexError("factorized 数据只支持 [sample, peak] 或 [sample, peak, feature] 访问")
+
+
 class YeastPeakSingleDataset(Dataset):
     """
     单Peak数据集 - 每个peak独立训练
     
     核心思想：
     - 每个peak作为独立的训练样本，不考虑peak之间的相关性
-    - 输入特征：motif (470维) + accessibility (1维) + condition (74维) = 545维
+    - 输入特征：motif (470维，已区分strand) + accessibility (1维) + condition (74维) = 545维
     - 输出标签：正链表达 (1个值) + 负链表达 (1个值) = 2个值
     
-    数据格式（KM酵母）：
-    - 原始数据 shape: (num_samples, num_peaks, 547)
-    - 前545列：输入特征
-    - 列545：正链表达量 (label_pos_idx)
-    - 列546：负链表达量 (label_neg_idx)
+    factorized 数据格式：
+    - peak_features:      (num_peaks, 471)
+    - condition_features: (num_samples, 74)
+    - peak_expression:    (num_samples, num_peaks, 2)
+    - 运行时拼接输入: peak_features + condition_features = 545维
     
     Args:
         data_path: .npz数据文件路径
@@ -299,14 +274,28 @@ class YeastPeakSingleDataset(Dataset):
         Args:
             data_path: .npz格式数据文件路径
         """
-        # 以内存映射方式加载数据文件（避免一次性加载到内存）
-        # mmap_mode='r' 表示只读模式，节省内存
+        # 加载 factorized npz。npz 压缩文件本身不能真正 mmap，但该版本体积较小，
+        # 直接读取三个核心数组比重建 dense cube 更省内存。
         npz_file = np.load(data_path, mmap_mode='r', allow_pickle=True)
-        
-        # 数据格式: (samples, peaks, features)
-        # 例如：(100, 5000, 360) 表示100个样本，每个样本5000个peaks，每个peak 360个特征
-        self.data = npz_file['data']
-        self.num_samples, self.num_peaks, self.num_features_all = self.data.shape
+        self._npz_file = npz_file
+
+        required_keys = ['peak_features', 'condition_features', 'peak_expression']
+        missing_keys = [key for key in required_keys if key not in npz_file.files]
+        if missing_keys:
+            raise KeyError(f"factorized npz 缺少必要字段: {missing_keys}")
+
+        self.peak_features = np.asarray(npz_file['peak_features'], dtype=np.float32)
+        self.condition_features = np.asarray(npz_file['condition_features'], dtype=np.float32)
+        self.peak_expression = np.asarray(npz_file['peak_expression'], dtype=np.float32)
+
+        self.num_peaks, self.peak_feature_dim = self.peak_features.shape
+        self.num_samples, self.condition_dim = self.condition_features.shape
+        expr_samples, expr_peaks, expr_dim = self.peak_expression.shape
+        if expr_samples != self.num_samples or expr_peaks != self.num_peaks or expr_dim != 2:
+            raise ValueError(
+                "peak_expression 维度不匹配: "
+                f"期望 ({self.num_samples}, {self.num_peaks}, 2)，实际 {self.peak_expression.shape}"
+            )
         
         # 读取peak_ids（用于CSV结果导出）
         try:
@@ -317,70 +306,51 @@ class YeastPeakSingleDataset(Dataset):
         except Exception:
             self.peak_ids = None
         
-        # 读取sample_ids（用于CSV结果导出）
-        try:
-            self.sample_ids = npz_file['sample_ids']
-            # 兼容object数组
-            if hasattr(self.sample_ids, 'tolist'):
-                self.sample_ids = self.sample_ids.tolist()
-        except Exception:
-            # 如果没有sample_ids，使用顺序编号
-            self.sample_ids = [str(i) for i in range(self.num_samples)]
-        
         logging.info(f"加载训练数据: {data_path}")
-        logging.info(f"训练模式: 单Peak训练（每个peak独立处理）")
-        
-        num_samples, num_peaks, num_features = self.data.shape
+        logging.info(f"训练模式: 单Peak训练（factorized 数据，运行时拼接特征）")
         
         # ========== 特征维度定义 ==========
         # 每个peak的输入特征由三部分组成：
-        # KM酵母特征维度定义
-        # 1. Motif特征（0-469列）：470个TF motif强度
+        # 1. Motif特征（0-469列）：470个转录因子结合位点的强度（已区分strand）
         # 2. Accessibility特征（470列）：染色质可及性
-        # 3. Condition特征（471-544列）：74个实验条件特征
-        self.motif_dim = 470  # Motif特征维度
-        self.accessibility_dim = 1  # 可及性特征维度
-        self.condition_dim = 74  # 条件特征维度
-        
-        # 标签在数据末尾：列545=正链表达，列546=负链表达
-        # 数据布局: [0:470)=motif, [470]=accessibility, [471:545)=condition, [545]=expr_pos_log2, [546]=expr_neg_log2
-        
-        # 验证数据格式是否正确（KM酵母）
-        if num_features == 547:
-            # 正确！特征545=pos, 546=neg
-            self.feature_dim = 545  # 前545列是输入特征
-            self.label_pos_idx = 545
-            self.label_neg_idx = 546
-            logging.info(f"✅ 数据格式正确: 547列 = 545特征 + 2标签(pos@545, neg@546)")
-        else:
-            logging.error(f"❌ 数据维度错误！期望547列（545特征+2标签），实际={num_features}")
-            raise ValueError(f"数据维度不匹配: 期望547，实际{num_features}")
-        
+        # 3. Condition特征（471-544列）：74个条件特征
+        self.motif_dim = 470
+        self.accessibility_dim = 1
+        self.feature_dim = self.peak_feature_dim + self.condition_dim
+        self.label_pos_idx = self.feature_dim
+        self.label_neg_idx = self.feature_dim + 1
+        self.num_features_all = self.feature_dim + 2
+
+        if self.peak_feature_dim != self.motif_dim + self.accessibility_dim:
+            raise ValueError(
+                f"peak_features 维度应为 471 (=470 motif + 1 accessibility)，实际 {self.peak_feature_dim}"
+            )
+        if self.condition_dim != 74:
+            raise ValueError(f"condition_features 维度应为 74，实际 {self.condition_dim}")
+        if self.feature_dim != 545:
+            raise ValueError(f"模型输入维度应为 545，实际 {self.feature_dim}")
+
+        # 旧代码会读取 self.data.shape；这里给一个轻量兼容层，不重建 dense cube。
+        self.data = _FactorizedDataView(self)
+        logging.info("✅ factorized 数据格式正确: 471 peak特征 + 74 condition特征 + 2标签")
+
         logging.info(f"特征维度: motif={self.motif_dim}, accessibility={self.accessibility_dim}, "
                     f"condition={self.condition_dim}, 总计={self.feature_dim}")
         logging.info(f"标签位置: pos={self.label_pos_idx}, neg={self.label_neg_idx}")
         
         # 生成所有有效的peak索引（正负链标签都不是NaN或inf）
-        self.valid_indices = []
-        for sample_idx in range(num_samples):
-            for peak_idx in range(num_peaks):
-                # 从data数组的最后两列读取标签
-                label_pos = self.data[sample_idx, peak_idx, self.label_pos_idx]
-                label_neg = self.data[sample_idx, peak_idx, self.label_neg_idx]
-                if not (np.isnan(label_pos) or np.isinf(label_pos) or 
-                        np.isnan(label_neg) or np.isinf(label_neg)):
-                    self.valid_indices.append((sample_idx, peak_idx))
+        valid_mask = np.isfinite(self.peak_expression[:, :, 0]) & np.isfinite(self.peak_expression[:, :, 1])
+        self.valid_indices = [(int(s), int(p)) for s, p in np.argwhere(valid_mask)]
         
         self.total = len(self.valid_indices)
         
-        logging.info(f"训练数据集: 样本={num_samples}, peaks/样本={num_peaks}, "
-                    f"特征数={num_features}, 有效peaks总数={self.total:,}")
+        logging.info(f"训练数据集: 样本={self.num_samples}, peaks/样本={self.num_peaks}, "
+                    f"输入特征数={self.feature_dim}, 有效peak×sample总数={self.total:,}")
 
         # ========== 加载 Gene-to-Peak 映射矩阵 ==========
         # BuildNumpy 输出同时包含历史命名 p2g_* 与直观命名 g2p_*（内容相同）。
-        # 这里做兼容处理：优先使用 g2p_*，若缺失则回退 p2g_*。
-        # 另外：对每行权重做归一化检查，必要时自动重新归一化，
-        # 确保后续 gene-level 聚合时不被异常放大/缩小。
+        # 这里做兼容处理：优先使用 g2p_*，若缺失则回退 p2g_*。同时做行归一化，
+        # 确保聚合时不会因为数值漂移放大/缩小表达量。
 
         def _load_or_none(key: str):
             try:
@@ -389,7 +359,7 @@ class YeastPeakSingleDataset(Dataset):
                 return None
 
         def _choose(prefix: str, fallback_prefix: str):
-            """选择一套 g2p 或 p2g 组件，返回 dict。"""
+            """选择一套 g2p 或 p2g 组件"""
             def _first_non_none(a, b):
                 return a if a is not None else b
             indices = _first_non_none(_load_or_none(f"{prefix}_indices"), _load_or_none(f"{fallback_prefix}_indices"))
@@ -430,40 +400,37 @@ class YeastPeakSingleDataset(Dataset):
             if mapping is None:
                 return None
             comps = (mapping.get('indices'), mapping.get('indptr'), mapping.get('data'), mapping.get('shape'))
-            # 注意：不能用 `None in comps`，因为 numpy.ndarray 的比较会返回数组，导致布尔值歧义
             if any(x is None for x in comps):
                 return None
             try:
                 csr = csr_matrix((mapping['data'], mapping['indices'], mapping['indptr']), shape=mapping['shape'])
             except Exception as e:
-                logging.warning(f"构建CSR失败: {e}")
+                logging.warning(f"构建 gene→peak CSR 失败: {e}")
                 return None
-            # 归一化检查与修正
+            # 行归一化（若偏差过大则修正）
             try:
                 row_sums = np.array(csr.sum(axis=1)).ravel()
                 need_fix = (row_sums > 0) & (np.abs(row_sums - 1.0) > 1e-3)
                 if np.any(need_fix):
-                    data = csr.data
+                    data = csr.data.copy()
                     indptr = csr.indptr
                     for r in np.where(need_fix)[0]:
-                        s, e = indptr[r], indptr[r+1]
+                        s, e = indptr[r], indptr[r + 1]
                         total = row_sums[r]
                         if total > 0:
                             data[s:e] /= total
                     csr = csr_matrix((data, csr.indices, indptr), shape=csr.shape)
                     logging.info(f"已重新归一化 {np.sum(need_fix)} 行 gene→peak 权重 (|sum-1|>1e-3)")
             except Exception as e:
-                logging.warning(f"归一化检查失败: {e}")
+                logging.warning(f"gene→peak 权重归一化检查失败: {e}")
             return csr
 
         self.g2p_pos_csr = _to_csr(self.g2p_pos)
         self.g2p_neg_csr = _to_csr(self.g2p_neg)
-
         if self.g2p_pos_csr is not None and self.g2p_neg_csr is not None:
             logging.info(
                 f"已加载 gene→peak 映射: pos_genes={self.g2p_pos_csr.shape[0]}, neg_genes={self.g2p_neg_csr.shape[0]}, peaks={self.g2p_pos_csr.shape[1]}"
             )
-            # 简单统计偏差（归一化后应接近1）
             pos_row_sums = np.array(self.g2p_pos_csr.sum(axis=1)).ravel()
             neg_row_sums = np.array(self.g2p_neg_csr.sum(axis=1)).ravel()
             logging.info(
@@ -472,48 +439,29 @@ class YeastPeakSingleDataset(Dataset):
         else:
             logging.warning("未发现可用的 gene→peak 权重 (g2p_/p2g_)，将跳过基因级评估。")
 
-    def has_gene_mapping(self) -> bool:
-        return self.g2p_pos_csr is not None and self.g2p_neg_csr is not None
-
-    def aggregate_gene_expression(self, peak_pred_pos: np.ndarray, peak_pred_neg: np.ndarray):
-        """将peak级预测聚合为基因级预测。
-        参数:
-          peak_pred_pos/neg: 形状 (n_peaks,) 或 (batch, n_peaks)
-        返回:
-          dict: { 'pos': np.ndarray(n_pos_genes,), 'neg': np.ndarray(n_neg_genes,), 'gene_ids_pos': [...], 'gene_ids_neg': [...] }
-        """
-        if not self.has_gene_mapping():
-            raise RuntimeError("gene→peak 映射缺失，无法聚合")
-        # 支持批次：若二维仅取第一维（当前单peak训练评估阶段一般是展开后再聚合）
-        if peak_pred_pos.ndim == 2:
-            peak_pred_pos = peak_pred_pos.mean(axis=0)
-        if peak_pred_neg.ndim == 2:
-            peak_pred_neg = peak_pred_neg.mean(axis=0)
-        pos_vals = self.g2p_pos_csr @ peak_pred_pos
-        neg_vals = self.g2p_neg_csr @ peak_pred_neg
-        return {
-            'pos': np.asarray(pos_vals).ravel(),
-            'neg': np.asarray(neg_vals).ravel(),
-            'gene_ids_pos': self.g2p_pos.get('gene_ids'),
-            'gene_ids_neg': self.g2p_neg.get('gene_ids')
-        }
-
-    def get_item_by_pair(self, sample_idx: int, peak_idx: int, dataset_idx: int | None = None):
-        # 获取单个peak的所有数据（总列=547；前545特征 + 2标签）
-        peak_data = self.data[sample_idx, peak_idx]
-        # 特征与标签
-        features = peak_data[:self.feature_dim]
-        label_pos = peak_data[self.label_pos_idx]
-        label_neg = peak_data[self.label_neg_idx]
+    def get_item_by_pair(self, sample_idx: int, peak_idx: int):
+        features = np.concatenate(
+            (self.peak_features[peak_idx], self.condition_features[sample_idx]),
+            axis=0
+        ).astype(np.float32, copy=False)
+        label_pos, label_neg = self.peak_expression[sample_idx, peak_idx]
         features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
         labels_tensor = torch.tensor([label_pos, label_neg], dtype=torch.float32).unsqueeze(0)
         return {
             'motif_features': features_tensor,
             'labels': labels_tensor,
             'sample_idx': sample_idx,
-            'peak_idx': peak_idx,
-            'dataset_idx': 0 if dataset_idx is None else int(dataset_idx)
+            'peak_idx': peak_idx
         }
+
+    def _build_dense_row(self, sample_idx: int, peak_idx: int):
+        """仅用于兼容调试/旧访问：返回 [545特征 + 2标签] 的一行。"""
+        features = np.concatenate(
+            (self.peak_features[peak_idx], self.condition_features[sample_idx]),
+            axis=0
+        ).astype(np.float32, copy=False)
+        labels = self.peak_expression[sample_idx, peak_idx].astype(np.float32, copy=False)
+        return np.concatenate((features, labels), axis=0)
 
     def __len__(self):
         return self.total
@@ -528,14 +476,7 @@ class FilteredBySamplesDataset(Dataset):
     def __init__(self, base_dataset: YeastPeakSingleDataset, allowed_samples: list):
         self.base = base_dataset
         self.allowed_samples = set(allowed_samples)
-        self.valid_indices = []
-        for p in self.base.valid_indices:
-            if len(p) == 3:
-                _, sidx, _ = p
-            else:
-                sidx, _ = p
-            if sidx in self.allowed_samples:
-                self.valid_indices.append(p)
+        self.valid_indices = [p for p in self.base.valid_indices if p[0] in self.allowed_samples]
         self.num_peaks = self.base.data.shape[1]
         # 暴露聚合相关
         self.g2p_pos_csr = self.base.g2p_pos_csr
@@ -544,58 +485,34 @@ class FilteredBySamplesDataset(Dataset):
         self.g2p_neg = self.base.g2p_neg
         self.parent_samples = sorted(list(self.allowed_samples))
         self.peak_ids = self.base.peak_ids
-        self.sample_ids = getattr(self.base, 'sample_ids', None)
 
     def __len__(self):
         return len(self.valid_indices)
 
     def __getitem__(self, idx: int):
-        key = self.valid_indices[idx]
-        if len(key) == 3:
-            ds_idx, sidx, pidx = key
-            return self.base.get_item_by_pair(sidx, pidx, ds_idx)
-        sidx, pidx = key
+        sidx, pidx = self.valid_indices[idx]
         return self.base.get_item_by_pair(sidx, pidx)
 
-
 class FilteredByIndicesDataset(Dataset):
-    """按indices列表过滤的数据集（用于Peak级划分）"""
-    def __init__(self, base_dataset, valid_indices: list):
+    """按 (sample_idx, peak_idx) 对过滤的数据集（兼容 peak/sample 两种划分）。"""
+
+    def __init__(self, base_dataset, valid_indices):
         self.base = base_dataset
         self.valid_indices = valid_indices
-        
-        # 提取所有涉及的samples（用于gene-level评估）
-        all_samples = set()
-        for idx in valid_indices:
-            if len(idx) == 3:
-                _, sidx, _ = idx
-            else:
-                sidx, _ = idx
-            all_samples.add(sidx)
-        self.parent_samples = sorted(list(all_samples))
-        
-        # 暴露必要属性
-        if hasattr(base_dataset, 'g2p_pos_csr'):
-            self.g2p_pos_csr = base_dataset.g2p_pos_csr
-            self.g2p_neg_csr = base_dataset.g2p_neg_csr
-            self.g2p_pos = base_dataset.g2p_pos
-            self.g2p_neg = base_dataset.g2p_neg
-        
-        if hasattr(base_dataset, 'peak_ids'):
-            self.peak_ids = base_dataset.peak_ids
-        
-        if hasattr(base_dataset, 'sample_ids'):
-            self.sample_ids = base_dataset.sample_ids
+
+        # 记录涉及到的样本，gene-level 聚合时需要
+        self.parent_samples = sorted({pair[0] for pair in valid_indices})
+
+        # 透出 gene→peak 信息 / peak_ids
+        for attr in ['g2p_pos_csr', 'g2p_neg_csr', 'g2p_pos', 'g2p_neg', 'peak_ids']:
+            if hasattr(base_dataset, attr):
+                setattr(self, attr, getattr(base_dataset, attr))
 
     def __len__(self):
         return len(self.valid_indices)
 
     def __getitem__(self, idx: int):
-        key = self.valid_indices[idx]
-        if len(key) == 3:
-            ds_idx, sidx, pidx = key
-            return self.base.get_item_by_pair(sidx, pidx, ds_idx)
-        sidx, pidx = key
+        sidx, pidx = self.valid_indices[idx]
         return self.base.get_item_by_pair(sidx, pidx)
 
 class MultiSinglePeakDataset(Dataset):
@@ -615,335 +532,167 @@ class MultiSinglePeakDataset(Dataset):
         # 添加num_samples属性（使用第一个数据集的样本数）
         # 假设所有数据集的样本数相同
         self.num_samples = self.datasets[0].num_samples if self.datasets else 0
-        
-        # 合并所有数据集的valid_indices
-        # valid_indices格式(多数据集): [(dataset_idx, sample_idx, peak_idx), ...]
-        # 同时创建映射：(sample_idx, peak_idx) → dataset_idx (仅兼容旧逻辑)
-        self.valid_indices = []
-        self.pair_to_dataset = {}  # 映射：(sample_idx, peak_idx) → dataset_idx
-        
-        for dataset_idx, dataset in enumerate(self.datasets):
-            for valid_pair in dataset.valid_indices:
-                sidx, pidx = valid_pair
-                self.valid_indices.append((dataset_idx, sidx, pidx))
-                # 记录这个(sample_idx, peak_idx)属于哪个数据集（可能覆盖）
-                self.pair_to_dataset[(sidx, pidx)] = dataset_idx
-        
-        # 暴露第一个数据集的属性（用于FilteredBySamplesDataset访问）
-        # 注意：这里假设所有数据集具有相同的结构，只是peaks不同
-        if self.datasets:
-            first_ds = self.datasets[0]
-            self.data = first_ds.data  # 保留第一个数据集的data引用（用于获取shape等）
-            self.g2p_pos_csr = first_ds.g2p_pos_csr
-            self.g2p_neg_csr = first_ds.g2p_neg_csr
-            self.g2p_pos = first_ds.g2p_pos
-            self.g2p_neg = first_ds.g2p_neg
-            self.peak_ids = first_ds.peak_ids  # 第一个数据集的peak_ids
-            self.sample_ids = first_ds.sample_ids  # 第一个数据集的sample_ids（假设所有数据集样本数相同）
-            
-            # 计算所有数据集中最大的peak数（用于gene-level评估时分配足够大的数组）
-            self.max_num_peaks = max([ds.data.shape[1] for ds in self.datasets])
-            logging.info(f"  各数据集peaks数: {[ds.data.shape[1] for ds in self.datasets]}")
-            logging.info(f"  最大peaks数: {self.max_num_peaks}")
             
         logging.info(f"多数据集单Peak加载完成，总Peak数: {self.total_size:,}")
         for i, (path, size) in enumerate(zip(data_paths, self.dataset_sizes)):
             logging.info(f"  数据集 {i+1}: {os.path.basename(path)} - {size:,} 个有效peaks")
 
     def __len__(self):
-        return len(self.valid_indices)
-
-    def get_item_by_pair(self, sample_idx: int, peak_idx: int, dataset_idx: int | None = None):
-        """根据(sample_idx, peak_idx)获取数据
-        
-        由于多数据集合并，需要找到这个pair属于哪个数据集
-        """
-        if dataset_idx is not None:
-            return self.datasets[int(dataset_idx)].get_item_by_pair(sample_idx, peak_idx, dataset_idx)
-
-        pair = (sample_idx, peak_idx)
-        if pair in self.pair_to_dataset:
-            dataset_idx = self.pair_to_dataset[pair]
-            return self.datasets[dataset_idx].get_item_by_pair(sample_idx, peak_idx, dataset_idx)
-
-        # 如果找不到映射，尝试在所有数据集中查找（后备）
-        for dataset in self.datasets:
-            if (sample_idx, peak_idx) in dataset.valid_indices:
-                return dataset.get_item_by_pair(sample_idx, peak_idx)
-
-        raise ValueError(f"无法找到pair ({sample_idx}, {peak_idx}) 在任何数据集中")
+        return self.total_size
 
     def __getitem__(self, idx: int):
-        key = self.valid_indices[idx]
-        if len(key) == 3:
-            ds_idx, sidx, pidx = key
-            return self.get_item_by_pair(sidx, pidx, ds_idx)
-        sidx, pidx = key
-        return self.get_item_by_pair(sidx, pidx)
-    
-    def get_dataset_idx(self, idx: int) -> int:
-        """获取指定索引对应的数据集索引
+        # 确定属于哪个数据集
+        dataset_idx = 0
+        cumulative_size = 0
+        dataset_start = 0  # 记录当前数据集的起始位置
+        for i, size in enumerate(self.dataset_sizes):
+            if idx < cumulative_size + size:
+                dataset_idx = i
+                dataset_start = cumulative_size
+                break
+            cumulative_size += size
         
-        Args:
-            idx: 样本索引
-            
-        Returns:
-            dataset_idx: 数据集索引（0, 1, 2, ...）
-        """
-        key = self.valid_indices[idx]
-        if len(key) == 3:
-            return key[0]  # (dataset_idx, sample_idx, peak_idx)
-        # 单数据集模式，返回0
-        return 0
+        # 在对应数据集中获取样本
+        local_idx = idx - dataset_start
+        return self.datasets[dataset_idx][local_idx]
 
-# =========================
-# 辅助函数：创建加权采样器
-# =========================
-def create_weighted_sampler(train_indices, dataset, config, logger):
-    """
-    为训练集创建加权随机采样器
-    
-    Args:
-        train_indices: 训练集索引列表，格式可能是:
-                      - 多数据集: [(dataset_idx, sample_idx, peak_idx), ...]
-                      - 单数据集: [(sample_idx, peak_idx), ...]
-        dataset: 数据集对象
-        config: 全局配置对象
-        logger: 日志记录器
-    
-    Returns:
-        WeightedRandomSampler 或 None（如果未启用权重）
-    """
-    # 检查是否启用数据集权重
-    use_weights = getattr(config.data, 'use_dataset_weights', False)
-    if not use_weights:
-        return None
-    
-    # 获取数据集权重配置
-    dataset_weights = getattr(config.data, 'dataset_weights', {})
-    if not dataset_weights:
-        logger.warning("⚠️ 启用了数据集权重但未配置权重值，使用均匀采样")
-        return None
-    
-    # 从配置中获取数据集名称列表
-    # 检查是否为多数据集（通过检查 dataset 是否有 datasets 属性）
-    is_multi_dataset = hasattr(dataset, 'datasets') and len(dataset.datasets) > 1
-    
-    # 获取数据集名称列表（从 config.data.input_files 的键）
-    if hasattr(config.data, 'input_files'):
-        if hasattr(config.data.input_files, 'keys'):
-            dataset_names = list(config.data.input_files.keys())
-        else:
-            dataset_names = list(config.data.input_files.__dict__.keys())
-    else:
-        dataset_names = []
-    
-    if not is_multi_dataset:
-        # 单数据集：所有样本使用相同权重
-        if dataset_names:
-            dataset_name = dataset_names[0]
-            weight = dataset_weights.get(dataset_name, 1.0)
-        else:
-            weight = 1.0
-        weights = [weight] * len(train_indices)
-        logger.info(f"✅ 单数据集加权采样: 权重 = {weight}")
-    else:
-        # 多数据集：根据每个索引所属的数据集分配权重
-        weights = []
-        for idx in train_indices:
-            if len(idx) == 3:  # 多数据集格式: (dataset_idx, sample_idx, peak_idx)
-                dataset_idx = idx[0]
-                if dataset_idx < len(dataset_names):
-                    dataset_name = dataset_names[dataset_idx]
-                    weight = dataset_weights.get(dataset_name, 1.0)
-                else:
-                    weight = 1.0
-            else:  # 单数据集格式: (sample_idx, peak_idx)
-                # 这种情况不应该出现在多数据集模式下，但为了安全起见
-                weight = 1.0
-            weights.append(weight)
-        
-        # 统计各数据集的权重使用情况
-        weight_stats = {}
-        for idx, weight in zip(train_indices, weights):
-            if len(idx) == 3:
-                dataset_idx = idx[0]
-                if dataset_idx < len(dataset_names):
-                    dataset_name = dataset_names[dataset_idx]
-                    if dataset_name not in weight_stats:
-                        weight_stats[dataset_name] = {'count': 0, 'weight': weight}
-                    weight_stats[dataset_name]['count'] += 1
-        
-        logger.info("✅ 多数据集加权采样配置:")
-        for name, stats in weight_stats.items():
-            logger.info(f"   {name}: 权重 = {stats['weight']:.2f}, 样本数 = {stats['count']:,}")
-    
-    # 创建加权随机采样器
-    # 注意：WeightedRandomSampler 需要权重张量，且长度必须等于数据集大小
-    weights_tensor = torch.tensor(weights, dtype=torch.float32)
-    sampler = WeightedRandomSampler(
-        weights=weights_tensor,
-        num_samples=len(train_indices),
-        replacement=True  # 允许重复采样以平衡不同权重的数据集
-    )
-    
-    return sampler
 
-# =========================
-# 划分策略：Peak 级
-# =========================
-def create_data_loaders_peak(dataset, config, logger):
-    """
-    按Peak级划分数据集（避免motif特征泄露）
-    
-    核心策略：
-    1. 识别所有unique peaks（来自4个ATAC样本）
-    2. 随机划分peaks为train/val/test（70%/15%/15%）
-    3. 同一个peak的所有54个实验条件都跟随该peak归属
-    
-    优势：
-    - 测试模型对新基因组位点的预测能力
-    - Motif特征（235维）严格隔离，无泄露
-    - 更符合实际应用（预测新调控元件的表达）
-    
-    注意：
-    - 实验条件会在train/val/test中重复（但只有6维，影响相对小）
-    - Gene-level评估在多数据集模式下禁用（因g2p矩阵维度不同）
-    
-    Args:
-        dataset: 原始数据集
-        config: 配置对象
-        logger: 日志记录器
-    
-    Returns:
-        train_loader, val_loader, test_loader: 三个数据加载器
-    """
-    
-    # 获取底层数据集
+def _split_indices(items, seed, ratios=(0.7, 0.15, 0.15)):
+    items = list(items)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(items)
+    n_total = len(items)
+    n_train = int(ratios[0] * n_total)
+    n_val = int(ratios[1] * n_total)
+    n_test = n_total - n_train - n_val
+    return items[:n_train], items[n_train:n_train + n_val], items[n_train + n_val: n_train + n_val + n_test]
+
+
+def build_and_save_split(dataset, config, logger, split_path=None):
+    """生成并可选保存 split，逻辑与训练脚本保持一致。"""
     base_ds = dataset
     try:
         while hasattr(base_ds, 'dataset'):
             base_ds = base_ds.dataset
     except Exception:
         pass
-    
+
+    strategy = getattr(config.data, 'split_strategy', 'peak')
+    if strategy not in {'peak', 'sample'}:
+        logger.warning(f"未知划分策略 '{strategy}'，回退为 peak")
+        strategy = 'peak'
+    seed = int(getattr(config.experiment, 'seed', 42))
+
+    split_info = {'strategy': strategy, 'seed': seed}
+
+    if strategy == 'sample':
+        num_samples = getattr(base_ds, 'num_samples', base_ds.data.shape[0])
+        train_ids, val_ids, test_ids = _split_indices(range(num_samples), seed)
+        split_info.update({
+            'train_samples': train_ids,
+            'val_samples': val_ids,
+            'test_samples': test_ids,
+        })
+    else:
+        if hasattr(base_ds, 'datasets'):
+            peak_keys = []
+            for dataset_idx, ds in enumerate(base_ds.datasets):
+                for _, peak_idx in ds.valid_indices:
+                    peak_keys.append((dataset_idx, int(peak_idx)))
+        else:
+            peak_keys = [int(peak_idx) for _, peak_idx in base_ds.valid_indices]
+        train_ids, val_ids, test_ids = _split_indices(peak_keys, seed)
+        split_info.update({
+            'train_peaks': train_ids,
+            'val_peaks': val_ids,
+            'test_peaks': test_ids,
+        })
+
+    if split_path is not None:
+        split_path = Path(split_path)
+        split_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(split_path, 'w', encoding='utf-8') as f:
+            json.dump(split_info, f, ensure_ascii=False, indent=2)
+        logger.info(f"✅ split 已保存到: {split_path}")
+
+    return split_info
+
+def create_data_loaders_peak(dataset, config, logger):
+    """按Peak级划分，确保同一peak的所有条件位于同一集合，避免motif特征泄露。"""
+    base_ds = dataset
+    try:
+        while hasattr(base_ds, 'dataset'):
+            base_ds = base_ds.dataset
+    except Exception:
+        pass
+
     logger.info("=" * 70)
     logger.info("📊 数据划分策略：Peak级划分（避免motif特征泄露）")
     logger.info("=" * 70)
-    
-    # 收集所有unique peaks及其对应的(sample_idx, peak_idx)对
-    peak_to_pairs = {}  # peak_identifier → [(sample_idx, peak_idx), ...]
-    
-    if hasattr(base_ds, 'datasets'):  # MultiSinglePeakDataset
-        logger.info(f"✅ 多数据集模式：{len(base_ds.datasets)}个ATAC样本")
-        
+
+    peak_to_pairs = {}
+    if hasattr(base_ds, 'datasets'):
+        logger.info(f"✅ 多数据集模式：{len(base_ds.datasets)} 个文件")
         for dataset_idx, ds in enumerate(base_ds.datasets):
             for sample_idx, peak_idx in ds.valid_indices:
-                # Peak identifier: (dataset_idx, peak_idx)
-                peak_id = (dataset_idx, peak_idx)
-
-                if peak_id not in peak_to_pairs:
-                    peak_to_pairs[peak_id] = []
-                # 记录三元组，避免跨数据集冲突
-                peak_to_pairs[peak_id].append((dataset_idx, sample_idx, peak_idx))
-    else:  # 单数据集
+                peak_to_pairs.setdefault((dataset_idx, peak_idx), []).append((sample_idx, peak_idx))
+    else:
         logger.info("✅ 单数据集模式")
         for sample_idx, peak_idx in base_ds.valid_indices:
-            peak_id = peak_idx  # 单数据集直接用peak_idx
+            peak_to_pairs.setdefault(peak_idx, []).append((sample_idx, peak_idx))
 
-            if peak_id not in peak_to_pairs:
-                peak_to_pairs[peak_id] = []
-            peak_to_pairs[peak_id].append((sample_idx, peak_idx))
-    
-    # 随机划分peaks
     all_peak_ids = list(peak_to_pairs.keys())
     rng = np.random.default_rng(config.experiment.seed)
     rng.shuffle(all_peak_ids)
-    
+
     n_total_peaks = len(all_peak_ids)
-    n_train_peaks = int(0.7 * n_total_peaks)
-    n_val_peaks = int(0.15 * n_total_peaks)
-    n_test_peaks = n_total_peaks - n_train_peaks - n_val_peaks
-    
-    train_peak_ids = set(all_peak_ids[:n_train_peaks])
-    val_peak_ids = set(all_peak_ids[n_train_peaks:n_train_peaks + n_val_peaks])
-    test_peak_ids = set(all_peak_ids[n_train_peaks + n_val_peaks:])
-    
-    # 根据peak归属，收集所有(sample_idx, peak_idx)对
-    train_indices = []
-    val_indices = []
-    test_indices = []
-    
-    for peak_id, pairs in peak_to_pairs.items():
-        if peak_id in train_peak_ids:
-            train_indices.extend(pairs)  # 该peak的所有54个条件都进入训练集
-        elif peak_id in val_peak_ids:
-            val_indices.extend(pairs)
-        elif peak_id in test_peak_ids:
-            test_indices.extend(pairs)
-    
+    n_train = int(0.7 * n_total_peaks)
+    n_val = int(0.15 * n_total_peaks)
+    n_test = n_total_peaks - n_train - n_val
+
+    train_ids = set(all_peak_ids[:n_train])
+    val_ids = set(all_peak_ids[n_train:n_train + n_val])
+    test_ids = set(all_peak_ids[n_train + n_val:])
+
+    def collect(target_ids):
+        out = []
+        for peak_id, pairs in peak_to_pairs.items():
+            if peak_id in target_ids:
+                out.extend(pairs)
+        return out
+
+    train_indices = collect(train_ids)
+    val_indices = collect(val_ids)
+    test_indices = collect(test_ids)
+
     logger.info(f"\n📈 Peak级划分统计:")
     logger.info(f"  总unique peaks: {n_total_peaks:,}")
-    logger.info(f"  ├─ 训练peaks: {n_train_peaks:,} ({n_train_peaks/n_total_peaks*100:.1f}%)")
-    logger.info(f"  ├─ 验证peaks: {n_val_peaks:,} ({n_val_peaks/n_total_peaks*100:.1f}%)")
-    logger.info(f"  └─ 测试peaks: {n_test_peaks:,} ({n_test_peaks/n_total_peaks*100:.1f}%)")
-    logger.info(f"")
-    logger.info(f"📈 训练样本数（peak×条件）:")
-    logger.info(f"  ├─ 训练集: {len(train_indices):,} 个样本")
-    logger.info(f"  ├─ 验证集: {len(val_indices):,} 个样本")
-    logger.info(f"  └─ 测试集: {len(test_indices):,} 个样本")
-    logger.info(f"")
-    logger.info(f"✅ 划分特点：同一peak的所有条件在同一集合（无motif泄露）")
-    logger.info("=" * 70)
-    
-    # 创建基于indices过滤的数据集
+    logger.info(f"  ├─ 训练peaks: {n_train:,} ({n_train/n_total_peaks*100:.1f}%)")
+    logger.info(f"  ├─ 验证peaks: {n_val:,} ({n_val/n_total_peaks*100:.1f}%)")
+    logger.info(f"  └─ 测试peaks: {n_test:,} ({n_test/n_total_peaks*100:.1f}%)")
+    logger.info(f"📈 样本数（peak×条件）: train={len(train_indices):,} / val={len(val_indices):,} / test={len(test_indices):,}")
+    logger.info("✅ 同一peak的所有条件保持在同一集合。")
+
+    def make_loader(subset, shuffle):
+        return DataLoader(
+            subset,
+            batch_size=config.training.batch_size,
+            shuffle=shuffle,
+            num_workers=config.training.num_workers,
+            pin_memory=True
+        )
+
     train_dataset = FilteredByIndicesDataset(base_ds, train_indices)
     val_dataset = FilteredByIndicesDataset(base_ds, val_indices)
     test_dataset = FilteredByIndicesDataset(base_ds, test_indices)
+    return (
+        make_loader(train_dataset, True),
+        make_loader(val_dataset, False),
+        make_loader(test_dataset, False),
+    )
 
-    # 创建加权采样器（如果启用）
-    weighted_sampler = create_weighted_sampler(train_indices, dataset, config, logger)
-    
-    # 创建DataLoader
-    # 如果使用加权采样器，则不能同时使用 shuffle
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=(weighted_sampler is None),  # 只有不使用采样器时才shuffle
-        sampler=weighted_sampler,  # 如果启用权重，使用加权采样器
-        num_workers=config.training.num_workers,
-        pin_memory=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        num_workers=config.training.num_workers,
-        pin_memory=True
-    )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        num_workers=config.training.num_workers,
-        pin_memory=True
-    )
-    
-    return train_loader, val_loader, test_loader
-
-# =========================
-# 划分策略：Sample 级
-# =========================
 def create_data_loaders_sample(dataset, config, logger):
-    """按样本级划分（每个样本的全部peaks留在同一集合，避免 gene 聚合泄露）。
-
-    比较：
-      - peak: 测试新位点泛化能力，gene-level需要列子矩阵修正。
-      - sample: 测试跨样本条件泛化，gene-level更直接（完整峰集合）。
-    返回: train_loader, val_loader, test_loader
-    """
+    """按样本级划分，保证gene级聚合时每个样本的所有peak完整保留。"""
     base_ds = dataset
     try:
         while hasattr(base_ds, 'dataset'):
@@ -952,7 +701,7 @@ def create_data_loaders_sample(dataset, config, logger):
         pass
 
     logger.info("=" * 70)
-    logger.info("📊 数据划分策略：Sample级划分（保持基因完整峰集合）")
+    logger.info("📊 数据划分策略：Sample级划分（保持样本内全部peaks）")
     logger.info("=" * 70)
 
     num_samples = getattr(base_ds, 'num_samples', base_ds.data.shape[0])
@@ -963,74 +712,64 @@ def create_data_loaders_sample(dataset, config, logger):
     n_train = int(0.7 * num_samples)
     n_val = int(0.15 * num_samples)
     n_test = num_samples - n_train - n_val
-    train_samples = all_samples[:n_train]
-    val_samples = all_samples[n_train:n_train + n_val]
-    test_samples = all_samples[n_train + n_val:]
 
-    logger.info(f"总样本: {num_samples} | 训练: {len(train_samples)} | 验证: {len(val_samples)} | 测试: {len(test_samples)}")
+    train_samples = set(all_samples[:n_train])
+    val_samples = set(all_samples[n_train:n_train + n_val])
+    test_samples = set(all_samples[n_train + n_val:])
 
-    # 生成索引列表
-    def collect_indices(sample_list):
+    logger.info(f"样本级划分: 总样本={num_samples}, 训练={len(train_samples)}, 验证={len(val_samples)}, 测试={len(test_samples)}")
+
+    def collect(sample_set):
         out = []
-        if hasattr(base_ds, 'datasets'):  # multi
-            for ds_idx, ds in enumerate(base_ds.datasets):
+        if hasattr(base_ds, 'datasets'):
+            for ds in base_ds.datasets:
                 for sidx, pidx in ds.valid_indices:
-                    if sidx in sample_list:
-                        out.append((ds_idx, sidx, pidx))
+                    if sidx in sample_set:
+                        out.append((sidx, pidx))
         else:
             for sidx, pidx in base_ds.valid_indices:
-                if sidx in sample_list:
+                if sidx in sample_set:
                     out.append((sidx, pidx))
         return out
 
-    train_indices = collect_indices(train_samples)
-    val_indices = collect_indices(val_samples)
-    test_indices = collect_indices(test_samples)
+    train_indices = collect(train_samples)
+    val_indices = collect(val_samples)
+    test_indices = collect(test_samples)
 
-    logger.info(f"训练样本(peak×条件)数: {len(train_indices):,}; 验证: {len(val_indices):,}; 测试: {len(test_indices):,}")
-    logger.info("✅ 同一样本的所有peaks保持在同一集合，gene-level评估无泄露。")
+    logger.info(f"样本(peak×条件)计数: train={len(train_indices):,}, val={len(val_indices):,}, test={len(test_indices):,}")
+
+    def make_loader(subset, shuffle):
+        return DataLoader(
+            subset,
+            batch_size=config.training.batch_size,
+            shuffle=shuffle,
+            num_workers=config.training.num_workers,
+            pin_memory=True
+        )
 
     train_dataset = FilteredByIndicesDataset(base_ds, train_indices)
     val_dataset = FilteredByIndicesDataset(base_ds, val_indices)
     test_dataset = FilteredByIndicesDataset(base_ds, test_indices)
+    return (
+        make_loader(train_dataset, True),
+        make_loader(val_dataset, False),
+        make_loader(test_dataset, False),
+    )
 
-    # 创建加权采样器（如果启用）
-    weighted_sampler = create_weighted_sampler(train_indices, dataset, config, logger)
-    
-    # 创建DataLoader
-    # 如果使用加权采样器，则不能同时使用 shuffle
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=(weighted_sampler is None),  # 只有不使用采样器时才shuffle
-        sampler=weighted_sampler,  # 如果启用权重，使用加权采样器
-        num_workers=config.training.num_workers,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        num_workers=config.training.num_workers,
-        pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        num_workers=config.training.num_workers,
-        pin_memory=True
-    )
-    return train_loader, val_loader, test_loader
-
-# =========================
-# 包装：根据配置选择划分策略
-# =========================
 def create_data_loaders(dataset, config, logger):
+    """根据配置选择 peak 或 sample 划分策略。"""
     strategy = getattr(config.data, 'split_strategy', 'peak')
     if strategy not in {'peak', 'sample'}:
         logger.warning(f"未知划分策略 '{strategy}'，回退使用 'peak'")
         strategy = 'peak'
+
+    split_save_path = getattr(config.data, 'split_cache_path', None)
+    if split_save_path:
+        try:
+            build_and_save_split(dataset, config, logger, split_save_path)
+        except Exception as e:
+            logger.warning(f"保存 split 失败，将继续按训练脚本直接切分: {e}")
+
     if strategy == 'sample':
         return create_data_loaders_sample(dataset, config, logger)
     return create_data_loaders_peak(dataset, config, logger)
@@ -1152,11 +891,53 @@ def evaluate_model(model, data_loader, device, logger, split_name="validation"):
         high_expr_mae = low_expr_mae = float('nan')
         logger.warning(f"{split_name}集指标计算失败: {e}")
     
-    # 简洁日志（统一 peak-level 风格）
-    logger.info(
-        f"[PEAK] {split_name} | r={pearson_r:.6f} | rho={spearman_rho:.6f} | R2={r2:.6f} | "
-        f"MAE={mae:.6f} | loss={avg_loss:.6f} | N={len(all_targets):,}"
-    )
+    # 按重要性排序输出评估结果 - 基因预测任务专用
+    logger.info(f"{split_name}集评估结果 (基因预测任务，按重要性排序):")
+    logger.info(f"  {'='*70}")
+    
+    # 1. 基因预测核心指标 (Top1-5)
+    logger.info(f"  🧬 基因预测核心指标:")
+    logger.info(f"    1. Pearson r (线性相关性) = {pearson_r:.6f} (p = {pearson_p:.2e}) ← 最重要")
+    logger.info(f"    2. MAE (平均绝对误差) = {mae:.6f} ← 预测准确性")
+    logger.info(f"    3. R² (决定系数) = {r2:.6f} ← 解释方差")
+    logger.info(f"    4. Spearman ρ (排序相关性) = {spearman_rho:.6f} (p = {spearman_p:.2e}) ← 排序相关性")
+    logger.info(f"    5. Kendall τ (排序一致性) = {kendall_tau:.6f} (p = {kendall_p:.2e}) ← 排序稳定性")
+    
+    # 2. 回归分析 (基因表达预测关键)
+    logger.info(f"  📈 回归分析 (基因表达预测):")
+    logger.info(f"    6. 回归斜率 = {slope:.6f} ← 表达水平缩放")
+    logger.info(f"    7. 回归截距 = {intercept:.6f} ← 基础表达水平")
+    logger.info(f"    8. 回归R² = {slope**2:.6f} ← 线性拟合度")
+    
+    # 3. 误差分析 (正态分布数据)
+    logger.info(f"  ⚠️  误差分析 (正态分布数据):")
+    logger.info(f"    9. RMSE (均方根误差) = {rmse:.6f} ← 大误差惩罚")
+    logger.info(f"    10. 中位数绝对误差 = {median_ae:.6f} ← 中值附近误差")
+    logger.info(f"    11. MAPE (平均绝对百分比误差) = {mape:.2f}% ← 相对误差")
+    logger.info(f"    12. MSE (均方误差) = {mse:.6f} ← 平方误差")
+    
+    # 4. 分布统计 (正态分布特征)
+    logger.info(f"  📊 分布统计 (正态分布特征):")
+    logger.info(f"    真实值: 均值={true_mean:.4f}, 标准差={true_std:.4f}, 中位数={np.median(all_targets_np):.4f}")
+    logger.info(f"    预测值: 均值={pred_mean:.4f}, 标准差={pred_std:.4f}, 中位数={np.median(all_preds_np):.4f}")
+    logger.info(f"    范围: 真实值=[{all_targets_np.min():.4f}, {all_targets_np.max():.4f}], 预测值=[{all_preds_np.min():.4f}, {all_preds_np.max():.4f}]")
+    
+    # 5. 误差分布 (正态分布数据)
+    logger.info(f"  🔍 误差分布 (正态分布数据):")
+    logger.info(f"    误差均值={error_mean:.6f}, 误差标准差={error_std:.6f}, 误差中位数={error_median:.6f}")
+    logger.info(f"    25%分位数误差={q25_error:.6f}, 75%分位数误差={q75_error:.6f}")
+    logger.info(f"    误差范围=[{errors.min():.6f}, {errors.max():.6f}]")
+    
+    # 6. 表达水平分层分析 (基因表达特征)
+    logger.info(f"  🎯 表达水平分层分析 (基因表达特征):")
+    logger.info(f"    高表达区域MAE = {high_expr_mae:.6f} (表达值 > {np.median(all_targets_np):.4f})")
+    logger.info(f"    低表达区域MAE = {low_expr_mae:.6f} (表达值 ≤ {np.median(all_targets_np):.4f})")
+    
+    # 7. 样本信息
+    logger.info(f"  📊 样本信息:")
+    logger.info(f"    有效peak数: {len(all_targets):,}")
+    logger.info(f"    损失: {avg_loss:.6f}")
+    logger.info(f"  {'='*70}")
     
     # 返回主要指标 (MAE作为主要指标)
     return avg_loss, mae, slope, intercept, all_preds, all_targets, spearman_p
@@ -1249,23 +1030,7 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
     # 从底层数据集上获取 g2p 信息
     g2p_pos = getattr(base_ds, 'g2p_pos_csr', None)
     g2p_neg = getattr(base_ds, 'g2p_neg_csr', None)
-    
-    # 检查是否是多数据集（MultiSinglePeakDataset）
-    is_multi_dataset = hasattr(base_ds, 'datasets') and len(getattr(base_ds, 'datasets', [])) > 1
-    
-    # 多数据集也需要映射：若是多数据集，采用“每个数据集内部用自己的矩阵聚合，再拼接指标”的策略
-    have_gene_eval = False
-    if is_multi_dataset:
-        # 只要每个子数据集都有自己的 g2p，就允许做 gene-level 评估
-        have_gene_eval = True
-        for ds in getattr(base_ds, 'datasets', []):
-            if getattr(ds, 'g2p_pos_csr', None) is None or getattr(ds, 'g2p_neg_csr', None) is None:
-                have_gene_eval = False
-                break
-        if not have_gene_eval:
-            logger.info("  ⚠️  多数据集模式：存在子数据集缺失 g2p 映射，gene-level 评估被跳过")
-    else:
-        have_gene_eval = (g2p_pos is not None) and (g2p_neg is not None)
+    have_gene_eval = (g2p_pos is not None) and (g2p_neg is not None)
 
     # 样本索引集合：
     # - 若数据集有明确的 parent_samples（样本级视图），优先使用
@@ -1275,27 +1040,7 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
         split_samples = list(range(base_ds.data.shape[0]))
     sample_to_local = {s: i for i, s in enumerate(split_samples)}
     n_split = len(split_samples)
-    
-    # 对于多数据集，使用max_num_peaks；单数据集使用data.shape[1]
-    n_peaks = getattr(base_ds, 'max_num_peaks', base_ds.data.shape[1])
-
-    # 收集当前split实际包含的peak索引（用于峰级划分时的列子集与行内再归一化）
-    included_peaks = None
-    if hasattr(data_loader.dataset, 'valid_indices') and isinstance(getattr(data_loader.dataset, 'valid_indices'), list):
-        try:
-            included_peaks = []
-            for item in data_loader.dataset.valid_indices:
-                if len(item) == 3:
-                    _, _, p = item
-                else:
-                    _, p = item
-                included_peaks.append(int(p))
-            included_peaks = sorted(set(included_peaks))
-        except Exception:
-            included_peaks = None
-    # 若未提供，默认使用全部列
-    if included_peaks is None:
-        included_peaks = list(range(n_peaks))
+    n_peaks = base_ds.data.shape[1]
 
     preds_pos = np.full((n_split, n_peaks), np.nan, dtype=np.float32)
     preds_neg = np.full((n_split, n_peaks), np.nan, dtype=np.float32)
@@ -1349,67 +1094,6 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
     gene_metrics = {}
     gene_detail = None
     if have_gene_eval:
-        # 重要说明：当前gene级真值来源于“将峰级真值使用相同的g2p矩阵做加权聚合”。
-        # 这不是独立的监督信号，聚合会降低噪声、提高相关性，因此gene级指标通常显著高于peak级，
-        # 更接近一个“上界”估计。若希望更严格评估，应提供独立的基因级真值（如TPM）并直接对比。
-        # gene-level 仅作为补充参考，日志保持简洁
-        # 若是peak级划分，仅使用当前split包含的列构造子矩阵，并在行内重新归一化
-        def _row_normalize(csr_mat):
-            if csr_mat is None:
-                return None
-            row_sums = np.array(csr_mat.sum(axis=1)).ravel()
-            data = csr_mat.data.copy()
-            indptr = csr_mat.indptr.copy()
-            fix_rows = (row_sums > 0)
-            for r in np.where(fix_rows)[0]:
-                s, e = indptr[r], indptr[r+1]
-                if e > s:
-                    data[s:e] /= (row_sums[r] + 1e-12)
-            return csr_matrix((data, csr_mat.indices.copy(), indptr), shape=csr_mat.shape)
-
-        if not is_multi_dataset:
-            try:
-                col_mask = np.zeros(n_peaks, dtype=bool)
-                col_mask[np.array(included_peaks, dtype=int)] = True
-                g2p_pos_eval = _row_normalize(g2p_pos[:, col_mask] if g2p_pos is not None else None)
-                g2p_neg_eval = _row_normalize(g2p_neg[:, col_mask] if g2p_neg is not None else None)
-            except Exception as e:
-                logger.warning(f"构造按split列的gene映射失败，将退回使用完整矩阵（缺失峰视为0）：{e}")
-                g2p_pos_eval = g2p_pos
-                g2p_neg_eval = g2p_neg
-        else:
-            # 多数据集：为每个子数据集单独准备列子矩阵与归一化
-            ds_col_mask = {}
-            ds_g2p_eval = {}
-            # 收集当前split涉及到的每个数据集的峰索引集合
-            pair_to_dataset = getattr(base_ds, 'pair_to_dataset', {})
-            ds_peaks_map = {}
-            if hasattr(data_loader.dataset, 'valid_indices'):
-                for item in data_loader.dataset.valid_indices:
-                    if len(item) == 3:
-                        ds_idx, _, pidx = item
-                    else:
-                        sidx, pidx = item
-                        ds_idx = pair_to_dataset.get((sidx, pidx), None)
-                    if ds_idx is None:
-                        continue
-                    ds_peaks_map.setdefault(int(ds_idx), set()).add(int(pidx))
-            # 为每个子数据集构造掩码和子矩阵（无列时跳过，避免生成(n_gene,0)导致错误聚合）
-            for ds_idx, ds in enumerate(getattr(base_ds, 'datasets', [])):
-                n_peaks_ds = ds.data.shape[1]
-                mask = np.zeros(n_peaks_ds, dtype=bool)
-                for p in ds_peaks_map.get(ds_idx, set()):
-                    if 0 <= p < n_peaks_ds:
-                        mask[p] = True
-                ds_col_mask[ds_idx] = mask
-                pos_csr = getattr(ds, 'g2p_pos_csr', None)
-                neg_csr = getattr(ds, 'g2p_neg_csr', None)
-                has_cols = bool(mask.any())
-                ds_g2p_eval[ds_idx] = (
-                    _row_normalize(pos_csr[:, mask]) if (pos_csr is not None and has_cols) else None,
-                    _row_normalize(neg_csr[:, mask]) if (neg_csr is not None and has_cols) else None
-                )
-
         preds_pos_f = np.nan_to_num(preds_pos, nan=0.0)
         preds_neg_f = np.nan_to_num(preds_neg, nan=0.0)
         trues_pos_f = np.nan_to_num(trues_pos, nan=0.0)
@@ -1420,124 +1104,18 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
 
         gene_pred_list = []
         gene_true_list = []
-        # 额外保存TPM域再log的聚合结果（可选）
-        gene_pred_list_tpm = []
-        gene_true_list_tpm = []
         gene_ids_list = []
         strand_list = []
         sample_list = []
         for i in range(n_split):
-            # 默认初始化为空，避免在多数据集路径下变量未定义
-            pos_pred_vec = np.array([])
-            pos_true_vec = np.array([])
-            neg_pred_vec = np.array([])
-            neg_true_vec = np.array([])
-            # TPM域变量默认空
-            pos_pred_vec_tpm = np.array([])
-            pos_true_vec_tpm = np.array([])
-            neg_pred_vec_tpm = np.array([])
-            neg_true_vec_tpm = np.array([])
-            if not is_multi_dataset:
-                # 单数据集逻辑
-                if g2p_pos_eval is not None and g2p_pos_eval.shape[1] < n_peaks:
-                    vec_pos = preds_pos_f[i, col_mask]
-                    vec_pos_true = trues_pos_f[i, col_mask]
-                    pos_pred_vec = g2p_pos_eval.dot(vec_pos)
-                    pos_true_vec = g2p_pos_eval.dot(vec_pos_true)
-                    # TPM域：先逆变换，再聚合，最后log
-                    vec_pos_tpm = np.power(2.0, vec_pos) - 1.0
-                    vec_pos_true_tpm = np.power(2.0, vec_pos_true) - 1.0
-                    pos_pred_vec_tpm = np.log2(g2p_pos_eval.dot(vec_pos_tpm) + 1.0)
-                    pos_true_vec_tpm = np.log2(g2p_pos_eval.dot(vec_pos_true_tpm) + 1.0)
-                else:
-                    if g2p_pos is not None:
-                        pos_pred_vec = g2p_pos.dot(preds_pos_f[i])
-                        pos_true_vec = g2p_pos.dot(trues_pos_f[i])
-                        # TPM域
-                        vec_pos = preds_pos_f[i]
-                        vec_pos_true = trues_pos_f[i]
-                        vec_pos_tpm = np.power(2.0, vec_pos) - 1.0
-                        vec_pos_true_tpm = np.power(2.0, vec_pos_true) - 1.0
-                        pos_pred_vec_tpm = np.log2(g2p_pos.dot(vec_pos_tpm) + 1.0)
-                        pos_true_vec_tpm = np.log2(g2p_pos.dot(vec_pos_true_tpm) + 1.0)
-
-                if g2p_neg_eval is not None and g2p_neg_eval.shape[1] < n_peaks:
-                    vec_neg = preds_neg_f[i, col_mask]
-                    vec_neg_true = trues_neg_f[i, col_mask]
-                    neg_pred_vec = g2p_neg_eval.dot(vec_neg)
-                    neg_true_vec = g2p_neg_eval.dot(vec_neg_true)
-                    # TPM域
-                    vec_neg_tpm = np.power(2.0, vec_neg) - 1.0
-                    vec_neg_true_tpm = np.power(2.0, vec_neg_true) - 1.0
-                    neg_pred_vec_tpm = np.log2(g2p_neg_eval.dot(vec_neg_tpm) + 1.0)
-                    neg_true_vec_tpm = np.log2(g2p_neg_eval.dot(vec_neg_true_tpm) + 1.0)
-                else:
-                    if g2p_neg is not None:
-                        neg_pred_vec = g2p_neg.dot(preds_neg_f[i])
-                        neg_true_vec = g2p_neg.dot(trues_neg_f[i])
-                        # TPM域
-                        vec_neg = preds_neg_f[i]
-                        vec_neg_true = trues_neg_f[i]
-                        vec_neg_tpm = np.power(2.0, vec_neg) - 1.0
-                        vec_neg_true_tpm = np.power(2.0, vec_neg_true) - 1.0
-                        neg_pred_vec_tpm = np.log2(g2p_neg.dot(vec_neg_tpm) + 1.0)
-                        neg_true_vec_tpm = np.log2(g2p_neg.dot(vec_neg_true_tpm) + 1.0)
-            else:
-                # 多数据集逻辑：对每个数据集分别聚合，然后拼接
-                # 先为该样本构建一个 dataset_idx -> (vec_pos, vec_neg) 的视图
-                # 使用预先准备的掩码与子矩阵
-                for ds_idx, ds in enumerate(getattr(base_ds, 'datasets', [])):
-                    pos_eval, neg_eval = ds_g2p_eval.get(ds_idx, (None, None))
-                    mask = ds_col_mask.get(ds_idx, None)
-                    if mask is None:
-                        continue
-                    if pos_eval is not None:
-                        vec_pos = preds_pos_f[i, :ds.data.shape[1]][mask]
-                        vec_pos_true = trues_pos_f[i, :ds.data.shape[1]][mask]
-                        pp = pos_eval.dot(vec_pos)
-                        pt = pos_eval.dot(vec_pos_true)
-                        if mask.any() and pp.size:
-                            gene_pred_list.append(pp)
-                            gene_true_list.append(pt)
-                            # TPM域
-                            vec_pos_tpm = np.power(2.0, vec_pos) - 1.0
-                            vec_pos_true_tpm = np.power(2.0, vec_pos_true) - 1.0
-                            pp_tpm = np.log2(pos_eval.dot(vec_pos_tpm) + 1.0)
-                            pt_tpm = np.log2(pos_eval.dot(vec_pos_true_tpm) + 1.0)
-                            gene_pred_list_tpm.append(pp_tpm)
-                            gene_true_list_tpm.append(pt_tpm)
-                            gids = getattr(ds, 'g2p_pos', {}).get('gene_ids', None)
-                            if gids is not None:
-                                gene_ids_list.extend([str(g) for g in gids])
-                                strand_list.extend(['+'] * len(pp))
-                                sample_list.extend([split_samples[i]] * len(pp))
-                    if neg_eval is not None:
-                        vec_neg = preds_neg_f[i, :ds.data.shape[1]][mask]
-                        vec_neg_true = trues_neg_f[i, :ds.data.shape[1]][mask]
-                        pn = neg_eval.dot(vec_neg)
-                        tn = neg_eval.dot(vec_neg_true)
-                        if mask.any() and pn.size:
-                            gene_pred_list.append(pn)
-                            gene_true_list.append(tn)
-                            # TPM域
-                            vec_neg_tpm = np.power(2.0, vec_neg) - 1.0
-                            vec_neg_true_tpm = np.power(2.0, vec_neg_true) - 1.0
-                            pn_tpm = np.log2(neg_eval.dot(vec_neg_tpm) + 1.0)
-                            tn_tpm = np.log2(neg_eval.dot(vec_neg_true_tpm) + 1.0)
-                            gene_pred_list_tpm.append(pn_tpm)
-                            gene_true_list_tpm.append(tn_tpm)
-                            gids = getattr(ds, 'g2p_neg', {}).get('gene_ids', None)
-                            if gids is not None:
-                                gene_ids_list.extend([str(g) for g in gids])
-                                strand_list.extend(['-'] * len(pn))
-                                sample_list.extend([split_samples[i]] * len(pn))
+            pos_pred_vec = g2p_pos.dot(preds_pos_f[i]) if g2p_pos is not None else np.array([])
+            pos_true_vec = g2p_pos.dot(trues_pos_f[i]) if g2p_pos is not None else np.array([])
+            neg_pred_vec = g2p_neg.dot(preds_neg_f[i]) if g2p_neg is not None else np.array([])
+            neg_true_vec = g2p_neg.dot(trues_neg_f[i]) if g2p_neg is not None else np.array([])
 
             if pos_pred_vec.size:
                 gene_pred_list.append(pos_pred_vec)
                 gene_true_list.append(pos_true_vec)
-                if pos_pred_vec_tpm.size:
-                    gene_pred_list_tpm.append(pos_pred_vec_tpm)
-                    gene_true_list_tpm.append(pos_true_vec_tpm)
                 if pos_gene_ids is not None:
                     gene_ids_list.extend([str(g) for g in pos_gene_ids])
                     strand_list.extend(['+'] * len(pos_pred_vec))
@@ -1545,40 +1123,14 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
             if neg_pred_vec.size:
                 gene_pred_list.append(neg_pred_vec)
                 gene_true_list.append(neg_true_vec)
-                if neg_pred_vec_tpm.size:
-                    gene_pred_list_tpm.append(neg_pred_vec_tpm)
-                    gene_true_list_tpm.append(neg_true_vec_tpm)
                 if neg_gene_ids is not None:
                     gene_ids_list.extend([str(g) for g in neg_gene_ids])
                     strand_list.extend(['-'] * len(neg_pred_vec))
                     sample_list.extend([split_samples[i]] * len(neg_pred_vec))
 
         if gene_pred_list:
-            gene_pred_concat_logspace = np.concatenate(gene_pred_list)
-            gene_true_concat_logspace = np.concatenate(gene_true_list)
-            
-            # ========== 两种聚合域：直接log空间 & TPM域再log ==========
-            agg_mode = getattr(base_ds, 'tpm_aggregation', 'logspace_direct')
-            
-            # 构建TPM域聚合结果
-            tpm_pred_concat = None
-            tpm_true_concat = None
-            if gene_pred_list_tpm:
-                tpm_pred_concat = np.concatenate(gene_pred_list_tpm)
-                tpm_true_concat = np.concatenate(gene_true_list_tpm)
-            
-            # ✅ 根据配置选择使用哪种聚合结果
-            if agg_mode == 'tpm_then_log' and tpm_pred_concat is not None:
-                # 使用TPM域聚合（生物学正确）
-                gene_pred_concat = tpm_pred_concat
-                gene_true_concat = tpm_true_concat
-                pass
-            else:
-                # 使用log空间直接聚合（默认）
-                gene_pred_concat = gene_pred_concat_logspace
-                gene_true_concat = gene_true_concat_logspace
-                pass
-            
+            gene_pred_concat = np.concatenate(gene_pred_list)
+            gene_true_concat = np.concatenate(gene_true_list)
             try:
                 gene_metrics = {
                     'mae': float(mean_absolute_error(gene_true_concat, gene_pred_concat)),
@@ -1586,72 +1138,20 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
                     'r2': float(r2_score(gene_true_concat, gene_pred_concat)),
                     'pearson_r': float(pearsonr(gene_true_concat, gene_pred_concat)[0]),
                     'mse': float(mean_squared_error(gene_true_concat, gene_pred_concat)),
-                    'agg_mode': agg_mode,
                 }
                 gene_detail = {
-                    'pred': gene_pred_concat,  # 使用选定的聚合结果
+                    'pred': gene_pred_concat,
                     'true': gene_true_concat,
                     'gene_ids': np.array(gene_ids_list) if len(gene_ids_list) else None,
                     'strands': np.array(strand_list) if len(strand_list) else None,
                     'sample_indices': np.array(sample_list) if len(sample_list) else None,
                 }
-                # 同时保存两种聚合结果供对比
-                gene_detail['pred_logspace'] = gene_pred_concat_logspace
-                gene_detail['true_logspace'] = gene_true_concat_logspace
-                if tpm_pred_concat is not None:
-                    gene_detail['pred_tpm_mode'] = tpm_pred_concat
-                    gene_detail['true_tpm_mode'] = tpm_true_concat
             except Exception as e:
                 logger.warning(f"gene级指标计算失败: {e}")
 
-            # ===== 真实TPM对比 =====
-            real_truth_map = getattr(base_ds, 'real_gene_truth', None)
-            if real_truth_map and gene_detail and gene_detail.get('gene_ids') is not None:
-                try:
-                    gids_all = gene_detail['gene_ids']
-                    preds_all = gene_detail['pred']
-                    # 汇总正负链重复：取平均
-                    accum = {}
-                    counts = {}
-                    for gid, val in zip(gids_all, preds_all):
-                        accum[gid] = accum.get(gid, 0.0) + float(val)
-                        counts[gid] = counts.get(gid, 0) + 1
-                    pred_reduced = {g: accum[g] / counts[g] for g in accum}
-                    overlap = [g for g in pred_reduced if g in real_truth_map]
-                    
-                    if len(overlap) > 0:
-                        # 计算真实TPM对比指标
-                        pred_vals = np.array([pred_reduced[g] for g in overlap])
-                        true_vals = np.array([real_truth_map[g] for g in overlap])
-                        
-                        real_metrics = {
-                            'pearson_r': float(pearsonr(true_vals, pred_vals)[0]),
-                            'spearman_rho': float(spearmanr(true_vals, pred_vals)[0]),
-                            'mae': float(mean_absolute_error(true_vals, pred_vals)),
-                            'r2': float(r2_score(true_vals, pred_vals)),
-                            'n_genes': len(overlap)
-                        }
-                        
-                        gene_detail['real_truth_metrics'] = real_metrics
-                        logger.info(f"[GENE-LEVEL_REAL] {split_name} Pearson={real_metrics['pearson_r']:.6f}, MAE={real_metrics['mae']:.6f}, Genes={real_metrics['n_genes']}")
-                    else:
-                        logger.warning("真实TPM对比：无重叠基因，跳过")
-                except Exception as e:
-                    logger.warning(f"真实TPM基因级对比失败: {e}")
-
+    logger.info(f"{split_name} - peak级 Pearson={peak_metrics.get('pearson_r', float('nan')):.6f}, MAE={peak_metrics.get('mae', float('nan')):.6f}")
     if gene_metrics:
-        logger.info(
-            f"[{split_name}] peak: r={peak_metrics.get('pearson_r', float('nan')):.6f}, "
-            f"mae={peak_metrics.get('mae', float('nan')):.6f}, r2={peak_metrics.get('r2', float('nan')):.6f}, "
-            f"n={len(all_preds_np):,} | gene: r={gene_metrics.get('pearson_r', float('nan')):.6f}, "
-            f"mae={gene_metrics.get('mae', float('nan')):.6f}, r2={gene_metrics.get('r2', float('nan')):.6f}"
-        )
-    else:
-        logger.info(
-            f"[{split_name}] peak: r={peak_metrics.get('pearson_r', float('nan')):.6f}, "
-            f"mae={peak_metrics.get('mae', float('nan')):.6f}, r2={peak_metrics.get('r2', float('nan')):.6f}, "
-            f"n={len(all_preds_np):,} | gene: N/A"
-        )
+        logger.info(f"{split_name} - gene级 Pearson={gene_metrics.get('pearson_r', float('nan')):.6f}, MAE={gene_metrics.get('mae', float('nan')):.6f}")
 
     # 汇总更详细的统计信息，便于外层日志输出
     out = {
@@ -1660,7 +1160,7 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
             'metrics': peak_metrics,
             'preds': all_preds_np,
             'targets': all_targets_np,
-            'count': len(all_preds_np)
+            'count': int(all_targets_np.size)
         },
         'gene': {
             'metrics': gene_metrics,
@@ -1750,40 +1250,36 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
     current_device = device
     
     # 准备数据集 - 单Peak版本
-    if len(experiment_config.input_files) == 1:
+    input_files = getattr(experiment_config, 'input_files', ['atac1'])
+    if len(input_files) == 1:
         # 单数据集
-        data_path = config.data.input_files[experiment_config.input_files[0]]
+        data_path = config.data.input_files[input_files[0]]
+        data_path = resolve_existing_path(data_path, os.path.dirname(os.path.abspath(__file__))) or Path(data_path)
         logger.info(f"使用单数据集: {data_path}")
-        dataset = YeastPeakSingleDataset(data_path)
+        dataset = YeastPeakSingleDataset(str(data_path))
     else:
         # 多数据集
-        data_paths = [config.data.input_files[f] for f in experiment_config.input_files]
+        data_paths = []
+        for key in input_files:
+            raw_path = config.data.input_files[key]
+            resolved = resolve_existing_path(raw_path, os.path.dirname(os.path.abspath(__file__))) or Path(raw_path)
+            data_paths.append(str(resolved))
         logger.info(f"使用多数据集: {len(data_paths)} 个文件")
         for i, path in enumerate(data_paths):
             logger.info(f"  数据集 {i+1}: {path}")
         dataset = MultiSinglePeakDataset(data_paths)
-
-    # 记录并附加聚合模式（peak->gene）
-    agg_mode = getattr(config.data, 'tpm_aggregation', 'logspace_direct')
-    setattr(dataset, 'tpm_aggregation', agg_mode)
-    logger.info(f"Gene聚合模式(tpm_aggregation): {agg_mode}")
-
-    # 加载真实TPM (若启用)
-    if getattr(config.data, 'use_real_gene_truth', False):
-        real_csv = getattr(config.data, 'real_gene_tpm_csv', None)
-        reduce_method = getattr(config.data, 'gene_truth_reduce', 'mean')
-        real_map = load_real_gene_tpm_csv(real_csv, reduce_method, logger=logger)
-        if real_map:
-            setattr(dataset, 'real_gene_truth', real_map)
-            logger.info(f"✅ 已附加真实基因TPM: {len(real_map)} genes")
-        else:
-            logger.warning("⚠️ 真实TPM加载失败或为空，继续使用聚合的峰级真值作为参考")
-    else:
-        logger.info("未启用真实TPM评价 (use_real_gene_truth = false)")
     
     # 创建数据加载器
     train_loader, val_loader, test_loader = create_data_loaders(dataset, config, logger)
     current_test_loader = test_loader
+
+    # 保存/输出当前 split，方便其他模型直接复用
+    try:
+        split_cache_path = getattr(config.data, 'split_cache_path', None)
+        if split_cache_path:
+            build_and_save_split(dataset, config, logger, split_cache_path)
+    except Exception as e:
+        logger.warning(f"split 缓存生成失败，但训练会继续: {e}")
     
     # 创建模型
     model = YeastModel(config.model.model)
@@ -1899,7 +1395,7 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
     # 记录模型结构到TensorBoard
     try:
         # 创建一个示例输入来记录模型结构 - 单Peak模式
-        # 特征维度: 470 motif + 1 accessibility + 74 condition = 545 (KM酵母)
+        # 特征维度: 470 motif + 1 accessibility + 74 condition = 545
         sample_input = torch.randn(1, 1, 545).to(device)  # [batch_size, 1, features]
         sample_features = {'motif_features': sample_input}
 
@@ -1933,7 +1429,7 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
     logger.info(f"开始训练，共 {config.training.max_epochs} 个epoch")
     if early_stopping_patience:
         logger.info(f"早停耐心值: {early_stopping_patience}, 最小改善阈值: {early_stopping_min_delta}")
-        logger.info(f"早停监控: peak-level Pearson r")
+        logger.info(f"早停监控指标: Pearson相关系数 (r) - 基因预测任务核心指标")
     
     # 详细验证历史记录（用于事后分析peak/gene级指标差异）
     val_history_rows = []
@@ -1959,7 +1455,7 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
             # ========== 数据准备 ==========
             # 单Peak模式：每个样本是一个peak
             # batch_labels shape: [batch_size, 1, 2] (2 = 正链+负链表达)
-            # features shape: [batch_size, 1, 545] (545 = 470 motif + 1 accessibility + 74 condition, KM酵母)
+            # features shape: [batch_size, 1, 545] (545 = 470 motif + 1 accessibility + 74 condition)
             batch_labels = batch_data['labels'].to(device)
             features_for_model = {'motif_features': batch_data['motif_features'].to(device)}
             
@@ -2012,12 +1508,19 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
         val_loss = val_eval['avg_loss']
         
         # ========== 选择主要监控指标 ==========
-        # KM 使用 peak-level Pearson r（gene 级聚合效果不佳）
-        val_pearson = val_eval['peak']['metrics'].get('pearson_r', float('nan'))
-        val_mae = val_eval['peak']['metrics'].get('mae', float('nan'))
-        val_r2 = val_eval['peak']['metrics'].get('r2', float('nan'))
-        val_spearman = val_eval['peak']['metrics'].get('spearman_rho', float('nan'))
-        monitor_level = 'peak'
+        # 优先使用gene级指标（如果有g2p映射）
+        # 原因：基因表达是最终预测目标，更能反映模型的真实性能
+        # 如果没有gene级数据（缺少g2p映射），则使用peak级指标
+        if val_eval['gene']['metrics']:
+            val_pearson = val_eval['gene']['metrics'].get('pearson_r', float('nan'))
+            val_mae = val_eval['gene']['metrics'].get('mae', float('nan'))
+            val_r2 = val_eval['gene']['metrics'].get('r2', float('nan'))
+            val_spearman = val_eval['gene']['metrics'].get('spearman_rho', float('nan'))
+        else:
+            val_pearson = val_eval['peak']['metrics'].get('pearson_r', float('nan'))
+            val_mae = val_eval['peak']['metrics'].get('mae', float('nan'))
+            val_r2 = val_eval['peak']['metrics'].get('r2', float('nan'))
+            val_spearman = val_eval['peak']['metrics'].get('spearman_rho', float('nan'))
 
         # 用 peak 级数据计算回归斜率和截距（用于可视化）
         try:
@@ -2036,19 +1539,18 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
         current_lr = optimizer.param_groups[0]['lr']
         writer.add_scalar('Learning_Rate', current_lr, epoch)
         lr_history.append(current_lr)
-        # 主监控指标（peak-level）
-        writer.add_scalar('Pearson/Peak', val_pearson, epoch)
-        writer.add_scalar('Spearman/Peak', val_spearman, epoch)
-        writer.add_scalar('R2/Peak', val_r2, epoch)
+        writer.add_scalar('Pearson/Validation', val_pearson, epoch)  # Pearson相关系数 (主监控)
+        writer.add_scalar('Spearman/Validation', val_spearman, epoch)
+        writer.add_scalar('R2/Validation', val_r2, epoch)
 
         # 同时记录peak级指标，便于对比
         if val_eval['peak']['metrics']:
-            writer.add_scalar('Peak/Pearson_r', val_eval['peak']['metrics'].get('pearson_r', float('nan')), epoch)
+            writer.add_scalar('Peak/Pearson', val_eval['peak']['metrics'].get('pearson_r', float('nan')), epoch)
             writer.add_scalar('Peak/MAE', val_eval['peak']['metrics'].get('mae', float('nan')), epoch)
             writer.add_scalar('Peak/R2', val_eval['peak']['metrics'].get('r2', float('nan')), epoch)
 
         if val_eval['gene']['metrics']:
-            writer.add_scalar('Gene/Pearson_r', val_eval['gene']['metrics'].get('pearson_r', float('nan')), epoch)
+            writer.add_scalar('Gene/Pearson', val_eval['gene']['metrics'].get('pearson_r', float('nan')), epoch)
             writer.add_scalar('Gene/MAE', val_eval['gene']['metrics'].get('mae', float('nan')), epoch)
             writer.add_scalar('Gene/R2', val_eval['gene']['metrics'].get('r2', float('nan')), epoch)
 
@@ -2070,14 +1572,28 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
         # 验证散点图输出频率：前10轮每2轮，之后每10轮
         if ((epoch + 1) <= 10 and (epoch + 1) % 2 == 0) or ((epoch + 1) > 10 and (epoch + 1) % 10 == 0):
             try:
-                # 固定使用 peak-level 数据生成散点图
-                targets_np = np.array(val_eval['peak']['targets'])
-                preds_np = np.array(val_eval['peak']['preds'])
-                level_name = 'peak'
-                scatter_pearson = val_eval['peak']['metrics'].get('pearson_r', float('nan'))
-                scatter_spearman = val_eval['peak']['metrics'].get('spearman_rho', float('nan'))
-                scatter_r2 = val_eval['peak']['metrics'].get('r2', float('nan'))
-                scatter_mae = val_eval['peak']['metrics'].get('mae', float('nan'))
+                # 确定使用哪个级别的数据 - 与早停模型选择保持一致
+                # 优先使用 gene 级数据（如果可用），否则使用 peak 级
+                if val_eval['gene']['metrics'] and val_eval['gene']['detail'] is not None:
+                    targets_np = np.array(val_eval['gene']['detail']['true'])
+                    preds_np = np.array(val_eval['gene']['detail']['pred'])
+                    level_name = 'gene'
+                    # 从gene级指标中获取对应的Pearson和MAE（确保一致）
+                    metrics_source = val_eval['gene']['metrics']
+                    scatter_pearson = val_eval['gene']['metrics'].get('pearson_r', float('nan'))
+                    scatter_spearman = val_eval['gene']['metrics'].get('spearman_rho', float('nan'))
+                    scatter_r2 = val_eval['gene']['metrics'].get('r2', float('nan'))
+                    scatter_mae = val_eval['gene']['metrics'].get('mae', float('nan'))
+                else:
+                    targets_np = np.array(val_eval['peak']['targets'])
+                    preds_np = np.array(val_eval['peak']['preds'])
+                    level_name = 'peak'
+                    # 从peak级指标中获取对应的Pearson和MAE（确保一致）
+                    metrics_source = val_eval['peak']['metrics']
+                    scatter_pearson = val_eval['peak']['metrics'].get('pearson_r', float('nan'))
+                    scatter_spearman = val_eval['peak']['metrics'].get('spearman_rho', float('nan'))
+                    scatter_r2 = val_eval['peak']['metrics'].get('r2', float('nan'))
+                    scatter_mae = val_eval['peak']['metrics'].get('mae', float('nan'))
                 
                 max_points = 100000
                 lo, hi = 0.0, 20.0
@@ -2106,7 +1622,7 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
                     pass
                 ax.set_xlabel('True expression', fontsize=14)
                 ax.set_ylabel('Predicted expression', fontsize=14)
-                ax.set_title(f'Validation predictions (peak-level) - Epoch {epoch+1}\nPearson r={scatter_pearson:.4f}, Spearman ρ={scatter_spearman:.4f}, R²={scatter_r2:.4f}', fontsize=16)
+                ax.set_title(f'Validation predictions ({level_name}-level) - Epoch {epoch+1}\nPearson r={scatter_pearson:.4f}, Spearman ρ={scatter_spearman:.4f}, R²={scatter_r2:.4f}', fontsize=16)
                 ax.set_xlim(lo, hi)
                 ax.set_ylim(lo, hi)
                 ax.tick_params(axis='both', labelsize=12)
@@ -2130,7 +1646,7 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
                 writer.flush()
                 scatter_path = scatter_dir / f'val_scatter_epoch_{epoch+1:04d}.png'
                 fig.savefig(scatter_path, dpi=300, bbox_inches='tight')
-                logger.info(f"✅ Saved validation scatter (peak-level) to: {scatter_path}")
+                logger.info(f"✅ Saved validation scatter (mixed) to: {scatter_path}")
                 plt.close(fig)
 
             except Exception as e:
@@ -2169,9 +1685,15 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
                 'config': config  # 完整配置（用于恢复实验）
             }, output_dir / 'best_model.pth')
             
-            logger.info(f"✨ Epoch {epoch+1}: 保存最佳模型 ({monitor_level}-level)")
-            logger.info(f"   Pearson r: {val_pearson:.6f} | Spearman ρ: {val_spearman:.6f}")
-            logger.info(f"   MAE: {val_mae:.6f} | R²: {val_r2:.6f}")
+            # 根据使用哪个级别指标显示不同的日志
+            if val_eval['gene']['metrics']:
+                logger.info(f"✨ Epoch {epoch+1}: 保存最佳模型 (Gene级指标)")
+                logger.info(f"   Pearson r: {val_pearson:.6f} | Spearman ρ: {val_spearman:.6f}")
+                logger.info(f"   MAE: {val_mae:.6f} | R²: {val_r2:.6f}")
+            else:
+                logger.info(f"✨ Epoch {epoch+1}: 保存最佳模型 (Peak级指标)")
+                logger.info(f"   Pearson r: {val_pearson:.6f} | Spearman ρ: {val_spearman:.6f}")
+                logger.info(f"   MAE: {val_mae:.6f} | R²: {val_r2:.6f}")
         else:
             # 模型没有改善，增加耐心计数器
             patience_counter += 1
@@ -2196,16 +1718,47 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
         val_spearmans.append(val_spearman)
         
         # 增强的epoch日志输出 - 分类清晰展示
+        logger.info(f"{'='*100}")
+        logger.info(f"📈 Epoch {epoch+1}/{config.training.max_epochs} - 训练总结")
+        logger.info(f"")
+        
+        # 训练指标
+        logger.info(f"  🎯 【训练集】")
+        logger.info(f"     损失: {avg_train_loss:.6f} | MAE: {avg_train_mae:.6f}")
+        logger.info(f"")
+        
+        # Gene级指标（主要监控指标）
+        logger.info(f"  🧬 【Gene级验证】(主要指标) ⭐")
+        if val_eval['gene']['metrics']:
+            gene_count = val_eval['gene'].get('count', 0)
+            logger.info(f"     Pearson r: {val_pearson:.6f}")
+            logger.info(f"     MAE:       {val_mae:.6f}")
+            logger.info(f"     R²:        {val_r2:.6f}")
+            logger.info(f"     Spearman ρ: {val_spearman:.6f}")
+            logger.info(f"     样本数:    {gene_count:,}")
+        else:
+            logger.info(f"     无 Gene 级数据（g2p 映射缺失）")
+        logger.info(f"")
+        
+        # Peak级指标（对比参考）
+        logger.info(f"  📊 【Peak级验证】(参考)")
+        peak_pearson = val_eval['peak']['metrics'].get('pearson_r', float('nan'))
+        peak_mae = val_eval['peak']['metrics'].get('mae', float('nan'))
+        peak_r2 = val_eval['peak']['metrics'].get('r2', float('nan'))
         peak_count = val_eval['peak'].get('count', 0)
-        gene_count = val_eval['gene'].get('count', 0)
-        gene_pearson = val_eval['gene']['metrics'].get('pearson_r', float('nan')) if val_eval['gene']['metrics'] else float('nan')
-        logger.info(
-            f"Epoch {epoch+1}/{config.training.max_epochs} | train_loss={avg_train_loss:.6f} | "
-            f"train_mae={avg_train_mae:.6f} | val_peak_r={val_pearson:.6f} | "
-            f"val_peak_mae={val_mae:.6f} | val_peak_r2={val_r2:.6f} | "
-            f"val_gene_r={gene_pearson:.6f} | n_peak={peak_count:,} | n_gene={gene_count:,} | "
-            f"lr={optimizer.param_groups[0]['lr']:.6f} | early_stop={patience_counter}/{early_stopping_patience or 'N/A'}"
-        )
+        logger.info(f"     Pearson r: {peak_pearson:.6f}")
+        logger.info(f"     MAE:       {peak_mae:.6f}")
+        logger.info(f"     R²:        {peak_r2:.6f}")
+        logger.info(f"     样本数:    {peak_count:,}")
+        logger.info(f"")
+        
+        # 其他信息
+        logger.info(f"  ⚙️  【其他】")
+        logger.info(f"     损失: {val_loss:.6f}")
+        logger.info(f"     拟合线: y = {val_slope:.4f}x + {val_intercept:.4f}")
+        logger.info(f"     学习率: {optimizer.param_groups[0]['lr']:.6f}")
+        logger.info(f"     早停计数: {patience_counter}/{early_stopping_patience or 'N/A'} {'✅ 最佳模型!' if patience_counter == 0 else ''}")
+        logger.info(f"{'='*100}")
     
     # 测试阶段：同时获得 peak 级（带meta）与 gene 级评估
     logger.info("开始测试阶段...")
@@ -2216,30 +1769,22 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
     
     # 保存最终结果
     try:
-        # 尝试获取peak_ids和sample_ids（用于CSV）
+        # 尝试获取peak_ids（用于CSV）
         try:
             peak_ids_for_csv = None
-            sample_ids_for_csv = None
             if isinstance(dataset, YeastPeakSingleDataset):
                 peak_ids_for_csv = dataset.peak_ids
-                sample_ids_for_csv = dataset.sample_ids
-            elif hasattr(dataset, 'peak_ids'):
-                # 多数据集或过滤后的数据集
-                peak_ids_for_csv = dataset.peak_ids
-                sample_ids_for_csv = getattr(dataset, 'sample_ids', None)
             # 更新全局变量，便于中断路径使用
             global current_peak_ids
             current_peak_ids = peak_ids_for_csv
         except Exception:
             peak_ids_for_csv = None
-            sample_ids_for_csv = None
 
         save_final_results(output_dir, train_losses, val_losses, train_maes, val_maes,
                           test_loss, test_mae, test_slope, test_intercept, test_preds, test_targets,
                           experiment_config, test_p, val_pearsons, val_spearmans, lr_history,
                           test_peak_indices=test_peak_indices, test_sample_indices=test_sample_indices,
                           test_strands=test_strands, test_peak_ids=peak_ids_for_csv,
-                          test_sample_ids=sample_ids_for_csv,
                           test_gene_detail=test_eval_gene.get('gene', {}).get('detail'),
                           test_gene_metrics=test_eval_gene.get('gene', {}).get('metrics'))
         logger.info("✅ 最终结果保存成功")
@@ -2292,7 +1837,7 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
         logger.info(f"✅ 超参数和指标已记录到 TensorBoard")
     except Exception as e:
         logger.warning(f"⚠️ 记录超参数到 TensorBoard 失败: {e}")
-
+    
     # 关闭TensorBoard writer
     writer.close()
     logger.info(f"TensorBoard日志已保存到: {tensorboard_dir}")
@@ -2314,7 +1859,7 @@ def save_final_results(output_dir, train_losses, val_losses, train_maes, val_mae
                       test_loss, test_mae, test_slope, test_intercept, test_preds, test_targets,
                       experiment_config, test_p=None, val_pearsons=None, val_spearmans=None, lr_history=None,
                       test_peak_indices=None, test_sample_indices=None, test_strands=None, test_peak_ids=None,
-                      test_sample_ids=None, test_gene_detail=None, test_gene_metrics=None):
+                      test_gene_detail=None, test_gene_metrics=None):
     """保存最终结果（按原文：仅拼接正负链的混合指标与图）- 增强版，每个绘图块独立处理"""
     # 获取logger（避免局部未定义）
     logger = logging.getLogger(__name__)
@@ -2380,20 +1925,9 @@ def save_final_results(output_dir, train_losses, val_losses, train_maes, val_mae
                     peak_id_vals = [''] * min_len
             else:
                 peak_id_vals = [''] * min_len
-            
-            # 映射sample_id
-            if test_sample_ids is not None:
-                try:
-                    sample_id_vals = [str(test_sample_ids[int(i)]) if int(i) < len(test_sample_ids) else str(i) for i in sample_idx_np]
-                except Exception:
-                    sample_id_vals = [str(i) for i in sample_idx_np]
-            else:
-                sample_id_vals = [str(i) for i in sample_idx_np]
-            
             strand_str = np.where(strand_np == 0, 'pos', 'neg')
             df_test = pd.DataFrame({
                 'sample_idx': sample_idx_np,
-                'sample_id': sample_id_vals,
                 'peak_idx': peak_idx_np,
                 'peak_id': peak_id_vals,
                 'strand': strand_str,
@@ -2463,7 +1997,7 @@ def save_final_results(output_dir, train_losses, val_losses, train_maes, val_mae
             gmae = (test_gene_metrics or {}).get('mae', np.nan)
             ax.set_xlabel('True gene expression', fontsize=14)
             ax.set_ylabel('Predicted gene expression', fontsize=14)
-            ax.set_title(f'[GENE-LEVEL] Test (gene-level)\nPearson r={gp:.4f}, Spearman ρ={gs:.4f}, R²={gr2:.4f}, MAE={gmae:.4f}', fontsize=16)
+            ax.set_title(f'Test (gene-level)\nPearson r={gp:.4f}, Spearman ρ={gs:.4f}, R²={gr2:.4f}, MAE={gmae:.4f}', fontsize=16)
             ax.set_xlim(lo, hi)
             ax.set_ylim(lo, hi)
             ax.tick_params(axis='both', labelsize=12)
@@ -2570,7 +2104,7 @@ def save_final_results(output_dir, train_losses, val_losses, train_maes, val_mae
 
         ax.set_xlabel('True expression', fontsize=14)
         ax.set_ylabel('Predicted expression', fontsize=14)
-        ax.set_title(f'[PEAK-LEVEL] Test Set (concat pos/neg)\nPearson r={test_pearson:.4f}, Spearman ρ={test_spearman:.4f}, R²={test_r2:.4f}', fontsize=16, fontweight='bold')
+        ax.set_title(f'Test Set (concat pos/neg)\nPearson r={test_pearson:.4f}, Spearman ρ={test_spearman:.4f}, R²={test_r2:.4f}', fontsize=16, fontweight='bold')
         ax.set_xlim(lo, hi)
         ax.set_ylim(lo, hi)
         ax.tick_params(axis='both', labelsize=12)
@@ -2608,8 +2142,6 @@ def save_final_results(output_dir, train_losses, val_losses, train_maes, val_mae
         max_points = 100000
         
         fig = plt.figure(figsize=(20, 12))
-        # 总标题：本图中的测试指标均为峰级（peak-level）
-        fig.suptitle('[PEAK-LEVEL] Training analysis (test metrics are peak-level)', fontsize=14, fontweight='bold')
         gs = fig.add_gridspec(3, 4, hspace=0.3, wspace=0.3)
         
         # 损失曲线
@@ -2723,8 +2255,7 @@ def save_final_results(output_dir, train_losses, val_losses, train_maes, val_mae
         ax10.legend(fontsize=10)
         ax10.grid(True, alpha=0.3)
         
-        # 为总标题留白
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.tight_layout()
         plt.savefig(output_dir / 'training_analysis.png', dpi=150, bbox_inches='tight')
         logger.info(f"✅ 训练分析图已保存: {output_dir / 'training_analysis.png'}")
         plt.close()
@@ -2822,7 +2353,7 @@ def save_final_results(output_dir, train_losses, val_losses, train_maes, val_mae
         f.write(f"- `tensorboard_logs/`: TensorBoard日志目录\n")
         f.write(f"- `train_single_peak.log`: 训练日志\n")
 
-@hydra.main(version_base=None, config_path="get_model/config", config_name="yeast_training_km")
+@hydra.main(version_base=None, config_path="../get_model/config", config_name="yeast_training_sc")
 def main(config: DictConfig):
     """主函数：运行ATAC单Peak训练"""
     
@@ -2830,38 +2361,22 @@ def main(config: DictConfig):
     logger.info("开始ATAC单Peak训练")
     logger.info(f"配置路径: {config}")
     
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
     # 从YAML配置中获取数据路径和训练配置
     input_files = config.data.input_files
-    output_base_dir = config.data.output_base_dir
+    output_base_dir = resolve_existing_path(config.data.output_base_dir, script_dir) or Path(script_dir) / config.data.output_base_dir
     training_name = config.training_name
     training_description = config.training_description
     output_dir = config.output_dir
     
-    # 检查输入文件（KM酵母多数据集：要求五份数据一起训练）
-    data_paths = []
-    if hasattr(input_files, 'keys'):
-        input_keys = list(input_files.keys())
-    else:
-        input_keys = list(input_files.__dict__.keys())
-
-    # 强制要求五份数据集并包含 ATAC1
-    expected_keys = {'c1', 'c3', 'o2', 'o3', 'atac1'}
-    missing_keys = expected_keys - set(input_keys)
-    if missing_keys:
-        logger.error(f"缺少必要数据集键: {sorted(list(missing_keys))}，当前仅有: {input_keys}")
-        raise ValueError("KM训练需同时提供 c1/c3/o2/o3/atac1 五份数据")
-    if len(input_keys) != 5:
-        logger.error(f"当前输入文件数量为 {len(input_keys)}，期望 5 个 (c1/c3/o2/o3/atac1)")
-        raise ValueError("KM训练需同时使用五份数据集")
-    for sample_name in input_keys:
-        path = getattr(input_files, sample_name)
-        if not os.path.exists(path):
-            logger.error(f"{sample_name.upper()}文件不存在: {path}")
-            raise FileNotFoundError(f"{sample_name.upper()}文件缺失")
-        data_paths.append(path)
-        logger.info(f"找到数据文件 {sample_name.upper()}: {path}")
+    # 检查输入文件
+    atac1_path = resolve_existing_path(input_files.atac1, script_dir)
+    if atac1_path is None:
+        logger.error(f"ATAC1文件不存在: {input_files.atac1}")
+        raise FileNotFoundError("ATAC1文件缺失")
     
-    logger.info(f"总计使用 {len(data_paths)} 个数据文件")
+    logger.info(f"使用数据文件: {atac1_path}")
     
     # 创建输出基础目录
     Path(output_base_dir).mkdir(parents=True, exist_ok=True)
@@ -2871,7 +2386,7 @@ def main(config: DictConfig):
         'name': training_name,
         'description': training_description,
         'output_dir': output_dir,
-        'input_files': input_keys
+        'input_files': ['atac1']
     })()
     
     # 运行训练
