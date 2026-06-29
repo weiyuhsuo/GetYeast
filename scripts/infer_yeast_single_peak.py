@@ -17,6 +17,14 @@
     - 如果设置了CONFIG_PATH，会作为备选配置（优先级低于脚本配置）
 """
 
+# Force GetForYeast scripts to run in the project conda environment.
+import os as _get_env_os
+import sys as _get_env_sys
+_GET_ENV_PYTHON = "/home/hyb_24110860026/anaconda3/envs/get/bin/python"
+if _get_env_os.path.realpath(_get_env_sys.executable) != _get_env_os.path.realpath(_GET_ENV_PYTHON):
+    _get_env_os.execv(_GET_ENV_PYTHON, [_GET_ENV_PYTHON, __file__, *_get_env_sys.argv[1:]])
+
+
 # ============================================================================
 # 📋 配置参数（请在此处修改）
 # ============================================================================
