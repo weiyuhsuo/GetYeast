@@ -447,6 +447,44 @@ class YeastPeakSingleDataset(Dataset):
         else:
             logging.warning("未发现可用的 gene→peak 权重 (g2p_/p2g_)，将跳过基因级评估。")
 
+        def _load_real_gene_expression(key: str):
+            if key not in npz_file.files:
+                return None
+            try:
+                arr = np.asarray(npz_file[key], dtype=np.float32)
+            except Exception as e:
+                logging.warning(f"加载 {key} 失败: {e}")
+                return None
+            if arr.ndim != 2 or arr.shape[0] != self.num_samples:
+                logging.warning(f"{key} 维度不匹配，期望 samples x genes 且 samples={self.num_samples}，实际 {arr.shape}")
+                return None
+            return arr
+
+        self.real_gene_expression_pos = _load_real_gene_expression('real_gene_expression_pos')
+        self.real_gene_expression_neg = _load_real_gene_expression('real_gene_expression_neg')
+        if self.real_gene_expression_pos is not None and self.g2p_pos_csr is not None:
+            if self.real_gene_expression_pos.shape[1] != self.g2p_pos_csr.shape[0]:
+                logging.warning(
+                    "real_gene_expression_pos gene维度与g2p_pos不一致: "
+                    f"{self.real_gene_expression_pos.shape[1]} vs {self.g2p_pos_csr.shape[0]}，跳过 real gene pos 评估"
+                )
+                self.real_gene_expression_pos = None
+        if self.real_gene_expression_neg is not None and self.g2p_neg_csr is not None:
+            if self.real_gene_expression_neg.shape[1] != self.g2p_neg_csr.shape[0]:
+                logging.warning(
+                    "real_gene_expression_neg gene维度与g2p_neg不一致: "
+                    f"{self.real_gene_expression_neg.shape[1]} vs {self.g2p_neg_csr.shape[0]}，跳过 real gene neg 评估"
+                )
+                self.real_gene_expression_neg = None
+        if self.real_gene_expression_pos is not None or self.real_gene_expression_neg is not None:
+            logging.info(
+                "已加载真实 gene expression 额外评估矩阵: "
+                f"pos={None if self.real_gene_expression_pos is None else self.real_gene_expression_pos.shape}, "
+                f"neg={None if self.real_gene_expression_neg is None else self.real_gene_expression_neg.shape}"
+            )
+        else:
+            logging.info("未发现 real_gene_expression_pos/neg，跳过 Real Gene 额外指标。")
+
     def get_item_by_pair(self, sample_idx: int, peak_idx: int):
         features = np.concatenate(
             (self.peak_features[peak_idx], self.condition_features[sample_idx]),
@@ -491,6 +529,8 @@ class FilteredBySamplesDataset(Dataset):
         self.g2p_neg_csr = self.base.g2p_neg_csr
         self.g2p_pos = self.base.g2p_pos
         self.g2p_neg = self.base.g2p_neg
+        self.real_gene_expression_pos = self.base.real_gene_expression_pos
+        self.real_gene_expression_neg = self.base.real_gene_expression_neg
         self.parent_samples = sorted(list(self.allowed_samples))
         self.peak_ids = self.base.peak_ids
 
@@ -512,7 +552,7 @@ class FilteredByIndicesDataset(Dataset):
         self.parent_samples = sorted({pair[0] for pair in valid_indices})
 
         # 透出 gene→peak 信息 / peak_ids
-        for attr in ['g2p_pos_csr', 'g2p_neg_csr', 'g2p_pos', 'g2p_neg', 'peak_ids']:
+        for attr in ['g2p_pos_csr', 'g2p_neg_csr', 'g2p_pos', 'g2p_neg', 'real_gene_expression_pos', 'real_gene_expression_neg', 'peak_ids']:
             if hasattr(base_dataset, attr):
                 setattr(self, attr, getattr(base_dataset, attr))
 
@@ -1035,10 +1075,13 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
     except Exception:
         pass
 
-    # 从底层数据集上获取 g2p 信息
+    # 从底层数据集上获取 g2p 信息，以及可选的真实 gene expression 额外评估矩阵
     g2p_pos = getattr(base_ds, 'g2p_pos_csr', None)
     g2p_neg = getattr(base_ds, 'g2p_neg_csr', None)
+    real_gene_pos = getattr(base_ds, 'real_gene_expression_pos', None)
+    real_gene_neg = getattr(base_ds, 'real_gene_expression_neg', None)
     have_gene_eval = (g2p_pos is not None) and (g2p_neg is not None)
+    have_real_gene_eval = have_gene_eval and ((real_gene_pos is not None) or (real_gene_neg is not None))
 
     # 样本索引集合：
     # - 若数据集有明确的 parent_samples（样本级视图），优先使用
@@ -1115,6 +1158,11 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
         gene_ids_list = []
         strand_list = []
         sample_list = []
+        real_gene_pred_list = []
+        real_gene_true_list = []
+        real_gene_ids_list = []
+        real_strand_list = []
+        real_sample_list = []
         for i in range(n_split):
             pos_pred_vec = g2p_pos.dot(preds_pos_f[i]) if g2p_pos is not None else np.array([])
             pos_true_vec = g2p_pos.dot(trues_pos_f[i]) if g2p_pos is not None else np.array([])
@@ -1128,6 +1176,13 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
                     gene_ids_list.extend([str(g) for g in pos_gene_ids])
                     strand_list.extend(['+'] * len(pos_pred_vec))
                     sample_list.extend([split_samples[i]] * len(pos_pred_vec))
+                if have_real_gene_eval and real_gene_pos is not None and real_gene_pos.shape[1] == len(pos_pred_vec):
+                    real_gene_pred_list.append(pos_pred_vec)
+                    real_gene_true_list.append(real_gene_pos[split_samples[i]])
+                    if pos_gene_ids is not None:
+                        real_gene_ids_list.extend([str(g) for g in pos_gene_ids])
+                        real_strand_list.extend(['+'] * len(pos_pred_vec))
+                        real_sample_list.extend([split_samples[i]] * len(pos_pred_vec))
             if neg_pred_vec.size:
                 gene_pred_list.append(neg_pred_vec)
                 gene_true_list.append(neg_true_vec)
@@ -1135,6 +1190,13 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
                     gene_ids_list.extend([str(g) for g in neg_gene_ids])
                     strand_list.extend(['-'] * len(neg_pred_vec))
                     sample_list.extend([split_samples[i]] * len(neg_pred_vec))
+                if have_real_gene_eval and real_gene_neg is not None and real_gene_neg.shape[1] == len(neg_pred_vec):
+                    real_gene_pred_list.append(neg_pred_vec)
+                    real_gene_true_list.append(real_gene_neg[split_samples[i]])
+                    if neg_gene_ids is not None:
+                        real_gene_ids_list.extend([str(g) for g in neg_gene_ids])
+                        real_strand_list.extend(['-'] * len(neg_pred_vec))
+                        real_sample_list.extend([split_samples[i]] * len(neg_pred_vec))
 
         if gene_pred_list:
             gene_pred_concat = np.concatenate(gene_pred_list)
@@ -1157,9 +1219,46 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
             except Exception as e:
                 logger.warning(f"gene级指标计算失败: {e}")
 
+        real_gene_metrics = {}
+        real_gene_detail = None
+        if real_gene_pred_list:
+            real_pred_concat = np.concatenate(real_gene_pred_list)
+            real_true_concat = np.concatenate(real_gene_true_list)
+            finite_mask = np.isfinite(real_pred_concat) & np.isfinite(real_true_concat)
+            real_pred_concat = real_pred_concat[finite_mask]
+            real_true_concat = real_true_concat[finite_mask]
+            try:
+                real_gene_metrics = {
+                    'mae': float(mean_absolute_error(real_true_concat, real_pred_concat)),
+                    'spearman_rho': float(spearmanr(real_true_concat, real_pred_concat)[0]),
+                    'r2': float(r2_score(real_true_concat, real_pred_concat)),
+                    'pearson_r': float(pearsonr(real_true_concat, real_pred_concat)[0]),
+                    'mse': float(mean_squared_error(real_true_concat, real_pred_concat)),
+                }
+                if len(real_gene_ids_list) == len(finite_mask):
+                    real_gene_ids_arr = np.array(real_gene_ids_list)[finite_mask]
+                    real_strands_arr = np.array(real_strand_list)[finite_mask]
+                    real_samples_arr = np.array(real_sample_list)[finite_mask]
+                else:
+                    real_gene_ids_arr = real_strands_arr = real_samples_arr = None
+                real_gene_detail = {
+                    'pred': real_pred_concat,
+                    'true': real_true_concat,
+                    'gene_ids': real_gene_ids_arr,
+                    'strands': real_strands_arr,
+                    'sample_indices': real_samples_arr,
+                }
+            except Exception as e:
+                logger.warning(f"real gene级指标计算失败: {e}")
+    else:
+        real_gene_metrics = {}
+        real_gene_detail = None
+
     logger.info(f"{split_name} - peak级 Pearson={peak_metrics.get('pearson_r', float('nan')):.6f}, MAE={peak_metrics.get('mae', float('nan')):.6f}")
     if gene_metrics:
         logger.info(f"{split_name} - gene级 Pearson={gene_metrics.get('pearson_r', float('nan')):.6f}, MAE={gene_metrics.get('mae', float('nan')):.6f}")
+    if real_gene_metrics:
+        logger.info(f"{split_name} - real gene级 Pearson={real_gene_metrics.get('pearson_r', float('nan')):.6f}, MAE={real_gene_metrics.get('mae', float('nan')):.6f}")
 
     # 汇总更详细的统计信息，便于外层日志输出
     out = {
@@ -1174,6 +1273,11 @@ def evaluate_model_gene_level(model, data_loader, device, logger, split_name="va
             'metrics': gene_metrics,
             'detail': gene_detail,
             'count': int(gene_detail['true'].size) if (gene_detail and gene_detail.get('true') is not None) else 0
+        },
+        'real_gene': {
+            'metrics': real_gene_metrics,
+            'detail': real_gene_detail,
+            'count': int(real_gene_detail['true'].size) if (real_gene_detail and real_gene_detail.get('true') is not None) else 0
         }
     }
     return out
@@ -1794,7 +1898,9 @@ def train_experiment(experiment_name: str, experiment_config: dict, config: Dict
                           test_peak_indices=test_peak_indices, test_sample_indices=test_sample_indices,
                           test_strands=test_strands, test_peak_ids=peak_ids_for_csv,
                           test_gene_detail=test_eval_gene.get('gene', {}).get('detail'),
-                          test_gene_metrics=test_eval_gene.get('gene', {}).get('metrics'))
+                          test_gene_metrics=test_eval_gene.get('gene', {}).get('metrics'),
+                          test_real_gene_detail=test_eval_gene.get('real_gene', {}).get('detail'),
+                          test_real_gene_metrics=test_eval_gene.get('real_gene', {}).get('metrics'))
         logger.info("✅ 最终结果保存成功")
     except Exception as e:
         logger.error(f"❌ 保存最终结果失败: {e}")
@@ -1867,7 +1973,8 @@ def save_final_results(output_dir, train_losses, val_losses, train_maes, val_mae
                       test_loss, test_mae, test_slope, test_intercept, test_preds, test_targets,
                       experiment_config, test_p=None, val_pearsons=None, val_spearmans=None, lr_history=None,
                       test_peak_indices=None, test_sample_indices=None, test_strands=None, test_peak_ids=None,
-                      test_gene_detail=None, test_gene_metrics=None):
+                      test_gene_detail=None, test_gene_metrics=None,
+                      test_real_gene_detail=None, test_real_gene_metrics=None):
     """保存最终结果（按原文：仅拼接正负链的混合指标与图）- 增强版，每个绘图块独立处理"""
     # 获取logger（避免局部未定义）
     logger = logging.getLogger(__name__)
@@ -1981,6 +2088,71 @@ def save_final_results(output_dir, train_losses, val_losses, train_maes, val_mae
         import traceback
         logger.error(traceback.format_exc())
     
+    # 额外保存 real gene 级预测结果 CSV（若提供）
+    try:
+        if test_real_gene_detail and test_real_gene_detail.get('pred') is not None and test_real_gene_detail.get('true') is not None:
+            rg_pred = np.array(test_real_gene_detail['pred'])
+            rg_true = np.array(test_real_gene_detail['true'])
+            rg_gene_ids = test_real_gene_detail.get('gene_ids')
+            rg_strands = test_real_gene_detail.get('strands')
+            rg_samples = test_real_gene_detail.get('sample_indices')
+            df = {
+                'true_real_gene': rg_true,
+                'pred_from_peak': rg_pred,
+                'error': rg_pred - rg_true,
+                'abs_error': np.abs(rg_pred - rg_true)
+            }
+            if rg_gene_ids is not None:
+                df['gene_id'] = rg_gene_ids
+            if rg_strands is not None:
+                df['strand'] = rg_strands
+            if rg_samples is not None:
+                df['sample_idx'] = rg_samples
+            df_real_gene = pd.DataFrame(df)
+            df_real_gene.to_csv(output_dir / 'test_real_gene_predictions.csv', index=False)
+            logger.info(f"✅ 已保存真实基因表达额外评估CSV: {len(df_real_gene)} 行")
+    except Exception as e:
+        logger.error(f"❌ 保存真实基因表达额外评估CSV失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+    # 生成 real gene 级散点图（若提供 real gene 明细与指标）
+    try:
+        if test_real_gene_detail and test_real_gene_detail.get('pred') is not None and test_real_gene_detail.get('true') is not None:
+            rg_pred = np.array(test_real_gene_detail['pred'])
+            rg_true = np.array(test_real_gene_detail['true'])
+            lo, hi = 0.0, 20.0
+            max_points = 100000
+            fig, ax = plt.subplots(figsize=(10, 10))
+            if len(rg_true) > max_points:
+                idx = np.random.choice(len(rg_true), max_points, replace=False)
+                x_plot = rg_true[idx]
+                y_plot = rg_pred[idx]
+            else:
+                x_plot = rg_true
+                y_plot = rg_pred
+            ax.scatter(x_plot, y_plot, s=1.5, alpha=0.15, c='#0f7b6c', edgecolors='none', zorder=1)
+            ax.plot([lo, hi], [lo, hi], 'r--', linewidth=1, label='y=x', zorder=10)
+            rgp = (test_real_gene_metrics or {}).get('pearson_r', np.nan)
+            rgs = (test_real_gene_metrics or {}).get('spearman_rho', np.nan)
+            rgr2 = (test_real_gene_metrics or {}).get('r2', np.nan)
+            rgmae = (test_real_gene_metrics or {}).get('mae', np.nan)
+            ax.set_xlabel('Real gene expression log2(TPM+1)', fontsize=14)
+            ax.set_ylabel('Predicted from peaks via g2p', fontsize=14)
+            ax.set_title(f'Test (real gene extra metric)\nPearson r={rgp:.4f}, Spearman ρ={rgs:.4f}, R²={rgr2:.4f}, MAE={rgmae:.4f}', fontsize=16)
+            ax.set_xlim(lo, hi)
+            ax.set_ylim(lo, hi)
+            ax.tick_params(axis='both', labelsize=12)
+            ax.legend(loc='lower right', fontsize=11, framealpha=0.95)
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            out_path = output_dir / 'test_real_gene_evaluation.png'
+            plt.savefig(out_path, dpi=300, bbox_inches='tight')
+            logger.info(f"✅ 真实基因表达额外评估散点图已保存: {out_path}")
+            plt.close(fig)
+    except Exception as e:
+        logger.warning(f"⚠️ 真实基因表达额外评估散点图保存失败: {e}")
+
     # 生成基因级散点图（若提供 gene 级明细与指标）
     try:
         if test_gene_detail and test_gene_detail.get('pred') is not None and test_gene_detail.get('true') is not None:
@@ -2067,6 +2239,16 @@ def save_final_results(output_dir, train_losses, val_losses, train_maes, val_mae
                 test_gene_metrics.get('r2', float('nan')),
                 test_gene_metrics.get('mae', float('nan')),
                 test_gene_metrics.get('mse', float('nan')),
+            ])
+        # 额外输出 real gene 指标；不参与 early stopping，也不替代现有 Gene Pearson r。
+        if test_real_gene_metrics:
+            metrics_list.extend(['Real Gene Pearson r', 'Real Gene Spearman ρ', 'Real Gene R²', 'Real Gene MAE', 'Real Gene MSE'])
+            values_list.extend([
+                test_real_gene_metrics.get('pearson_r', float('nan')),
+                test_real_gene_metrics.get('spearman_rho', float('nan')),
+                test_real_gene_metrics.get('r2', float('nan')),
+                test_real_gene_metrics.get('mae', float('nan')),
+                test_real_gene_metrics.get('mse', float('nan')),
             ])
         
         metrics_summary = pd.DataFrame({
